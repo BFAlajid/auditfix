@@ -6,7 +6,7 @@ import { Command, Option } from 'commander';
 import { existsSync, statSync } from 'node:fs';
 import { analyze } from '../core/analyzer.js';
 import { loadConfig } from '../core/config.js';
-import { renderTerminalReport, getExitCode } from './output/terminal.js';
+import { renderTerminalReport, getExitCode, getExitCodeForStrategy } from './output/terminal.js';
 import { renderJsonReport } from './output/json.js';
 import { renderSarifReport } from './output/sarif.js';
 import { generateSbom } from './output/sbom.js';
@@ -19,10 +19,12 @@ import { detectAndParseLockfile } from '../core/lockfile/parser.js';
 import { scanInstallScripts } from '../core/scanner/install-scripts.js';
 import { scanLicenses } from '../core/scanner/license-checker.js';
 import { sendWebhook } from '../core/notify/webhook.js';
+import { checkDepAge } from '../core/scanner/dep-age.js';
+import { diffReports } from '../core/diff.js';
 import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
 import * as logger from '../utils/logger.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, watch as fsWatch } from 'node:fs';
 import * as path from 'node:path';
 import { join } from 'node:path';
 import { safeJsonParse } from '../utils/sanitize.js';
@@ -49,8 +51,11 @@ program
   .option('--remediate', 'Show guided remediation plan', false)
   .option('--create-pr', 'Create a GitHub PR with fixes (requires gh CLI)', false)
   .option('--ci', 'CI mode: no colors, minimal output, strict exit codes', false)
+  .addOption(new Option('--fail-on <strategy>', 'CI exit code strategy').choices(['production-critical', 'production-high', 'any']))
   .option('--check-licenses', 'Scan dependencies for copyleft/problematic licenses', false)
+  .option('--check-deps-age', 'Flag packages with no updates in 2+ years', false)
   .option('--webhook <url>', 'Send results to a webhook URL (Slack or generic)')
+  .option('--watch', 'Watch lockfile for changes and re-scan', false)
   .option('--verbose', 'Enable debug logging', false)
   .option('--dir <path>', 'Project directory to scan', process.cwd())
   .option('-w, --workspace <name>', 'Filter results to a specific workspace (monorepo)')
@@ -71,6 +76,43 @@ program
       process.exit(2);
     }
     options.dir = dir;
+
+    // --watch mode: watch lockfiles and re-scan
+    if (options.watch) {
+      console.log(chalk.bold('Watch mode: monitoring lockfiles for changes...'));
+      const lockfiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'];
+      let scanning = false;
+      const runScan = async () => {
+        if (scanning) return;
+        scanning = true;
+        console.log(chalk.dim(`\n[${new Date().toLocaleTimeString()}] Lockfile changed, re-scanning...`));
+        try {
+          const config = await loadConfig({}, options.dir);
+          const report = await analyze({
+            projectDir: options.dir,
+            productionOnly: config.productionOnly,
+            severityThreshold: config.severity,
+          });
+          console.log(renderTerminalReport(report, VERSION));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error(msg);
+        }
+        scanning = false;
+      };
+      // Initial scan
+      await runScan();
+      // Watch for changes
+      for (const lockfile of lockfiles) {
+        const lockPath = join(options.dir, lockfile);
+        if (existsSync(lockPath)) {
+          fsWatch(lockPath, { persistent: true }, () => { runScan(); });
+          logger.info(`Watching ${lockfile}`);
+        }
+      }
+      // Keep process alive
+      return;
+    }
 
     try {
       // --sbom: generate CycloneDX SBOM and exit (no audit needed)
@@ -158,6 +200,23 @@ program
         }
       }
 
+      // Check dependency age if requested
+      if (options.checkDepsAge) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        console.log('');
+        console.log(chalk.bold('Checking dependency freshness...'));
+        const ageFindings = await checkDepAge(lockfileResult.graph);
+        if (ageFindings.length > 0) {
+          console.log(chalk.yellow(`${ageFindings.length} packages with no updates in 2+ years:`));
+          for (const f of ageFindings) {
+            const scope = f.isProduction ? chalk.red('PROD') : chalk.dim('dev');
+            console.log(`  ${scope} ${chalk.bold(f.package)}@${f.version} — last published ${f.lastPublished} (${f.ageMonths} months ago)`);
+          }
+        } else {
+          console.log(chalk.green('All dependencies are actively maintained.'));
+        }
+      }
+
       // Send webhook notification if URL provided
       if (options.webhook) {
         let projectName: string | undefined;
@@ -206,7 +265,9 @@ program
         }
       }
 
-      const exitCode = getExitCode(report);
+      const exitCode = options.failOn
+        ? getExitCodeForStrategy(report, options.failOn)
+        : getExitCode(report);
       process.exit(exitCode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -259,6 +320,58 @@ program
     console.log('');
     console.log('The index is a last-resort fallback. For real-time data, auditfix');
     console.log('queries OSV.dev API directly (Tier 1) on every scan.');
+  });
+
+program
+  .command('diff <baseline> <current>')
+  .description('Compare two auditfix JSON reports and show changes')
+  .action((baselinePath: string, currentPath: string) => {
+    let baselineJson: string;
+    let currentJson: string;
+    try {
+      baselinePath = path.resolve(baselinePath);
+      currentPath = path.resolve(currentPath);
+      baselineJson = readFileSync(baselinePath, 'utf-8');
+      currentJson = readFileSync(currentPath, 'utf-8');
+    } catch (err) {
+      logger.error(`Failed to read report files: ${err instanceof Error ? err.message : err}`);
+      process.exit(2);
+    }
+
+    const baseline = safeJsonParse<{ vulnerabilities: Array<{ id: string; package: string; installedVersion: string; severity: string; score: number }> }>(baselineJson);
+    const current = safeJsonParse<{ vulnerabilities: Array<{ id: string; package: string; installedVersion: string; severity: string; score: number }> }>(currentJson);
+
+    const diff = diffReports(baseline, current);
+
+    if (diff.added.length > 0) {
+      console.log(chalk.red.bold(`\n+ ${diff.added.length} NEW vulnerabilities:`));
+      for (const v of diff.added) {
+        console.log(chalk.red(`  + ${v.package}@${v.version} — ${v.id} (${v.severity}, score: ${v.score})`));
+      }
+    }
+
+    if (diff.removed.length > 0) {
+      console.log(chalk.green.bold(`\n- ${diff.removed.length} FIXED vulnerabilities:`));
+      for (const v of diff.removed) {
+        console.log(chalk.green(`  - ${v.package}@${v.version} — ${v.id} (${v.severity})`));
+      }
+    }
+
+    if (diff.unchanged.length > 0) {
+      console.log(chalk.dim(`\n  ${diff.unchanged.length} unchanged vulnerabilities`));
+    }
+
+    console.log('');
+    if (diff.summary.improved) {
+      console.log(chalk.green.bold('Result: IMPROVED — vulnerabilities reduced, none added'));
+    } else if (diff.added.length > 0) {
+      console.log(chalk.red.bold(`Result: REGRESSED — ${diff.added.length} new vulnerabilities`));
+    } else {
+      console.log(chalk.dim('Result: No change'));
+    }
+
+    // Exit 1 if there are new vulns (useful for CI gating)
+    process.exit(diff.added.length > 0 ? 1 : 0);
   });
 
 async function runFix(projectDir: string, report: import('../types/report.js').AuditReport): Promise<import('../core/fixer/lockfile-writer.js').FixResult | null> {

@@ -164,3 +164,30 @@ export function getExitCode(report: AuditReport): number {
 
   return hasProdVulns ? 1 : 0;
 }
+
+/**
+ * Configurable exit code strategy for CI.
+ * - production-critical: exit 1 only for production critical vulns
+ * - production-high: exit 1 for production critical or high vulns (default)
+ * - any: exit 1 for any vulnerability regardless of severity
+ */
+export function getExitCodeForStrategy(
+  report: AuditReport,
+  strategy: string,
+): number {
+  if (report.metadata.confidence === 'UNRELIABLE') return 2;
+
+  switch (strategy) {
+    case 'production-critical':
+      return report.vulnerabilities.some(
+        (v) => v.match.isProduction && v.risk.label === 'critical'
+      ) ? 1 : 0;
+
+    case 'any':
+      return report.vulnerabilities.length > 0 ? 1 : 0;
+
+    case 'production-high':
+    default:
+      return getExitCode(report);
+  }
+}

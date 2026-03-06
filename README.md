@@ -3,8 +3,46 @@
 [![CI](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml/badge.svg)](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/auditfix)](https://www.npmjs.com/package/auditfix)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 
 Smarter npm dependency security CLI. Replaces `npm audit` with production reachability analysis, risk scoring, and safe auto-fixes.
+
+## Example Output
+
+```
+auditfix v1.4.0 — scanned 847 packages
+
+CRITICAL (1)
+  lodash@4.17.20 — Prototype Pollution in lodash
+  Path: my-app > lodash
+  Production: YES | Exploit: NO | Fix: 4.17.21
+  → Run `auditfix --fix` to auto-patch
+
+HIGH (2)
+  express@4.17.1 — Open redirect in express
+  Path: my-app > express
+  Production: YES | Exploit: NO | Fix: 4.19.2
+  → Run `auditfix --fix` to auto-patch
+
+  jsonwebtoken@8.5.1 — Insecure default algorithm in jsonwebtoken
+  Path: my-app > jsonwebtoken
+  Production: YES | Exploit: NO | Fix: 9.0.0
+  → Run `auditfix --fix` to auto-patch
+
+MEDIUM (0)
+LOW (1)
+  semver@5.7.1 — ReDoS in semver
+  Path: my-app > semver
+  Production: NO (dev only) | Exploit: NO | Fix: 7.5.2
+  → Low risk. Dev tooling only.
+
+Scanned: 847 packages
+Advisory source: OSV.dev API (real-time) | Matched against: 312 advisories
+Confidence: HIGH
+
+Summary: 1 critical (1 production) | 2 high (2 production) | 1 low (dev-only)
+CI exit code: 1 (production vulnerabilities found)
+```
 
 ## Why auditfix?
 
@@ -14,15 +52,18 @@ Smarter npm dependency security CLI. Replaces `npm audit` with production reacha
 - **Import chain analysis** — Static analysis of import/require statements to verify packages are actually imported
 - **Risk scoring** — Composite score (0-100) based on CVSS, production exposure, exploit availability, and fix availability
 - **Safe auto-fix** — Automatically applies non-breaking updates via lockfile overrides (npm, yarn, pnpm)
+- **Scan diff** — Compare two scans to detect regressions (`auditfix diff baseline.json current.json`)
 - **Multi-lockfile support** — npm, yarn (classic + berry), and pnpm
 - **Monorepo support** — Workspace detection with per-workspace vulnerability mapping
 - **CycloneDX SBOM** — Generate a CycloneDX 1.5 Software Bill of Materials
 - **Install script scanner** — Detect suspicious `postinstall`/`preinstall` scripts
 - **License scanner** — Detect copyleft and incompatible licenses in dependencies
+- **Dependency age checker** — Flag unmaintained packages with no updates in 2+ years
 - **Guided remediation** — Holistic fix plans ranked by impact
 - **GitHub PR creation** — Automatically create PRs with security fixes
 - **Webhook notifications** — Post scan results to Slack or any webhook endpoint
-- **CI mode** — Machine-friendly JSON output with no colors for CI pipelines
+- **CI mode** — Machine-friendly JSON output with configurable exit code strategies
+- **Watch mode** — Monitor lockfiles and re-scan on changes
 - **Offline mode** — Bundled advisory index works with zero network access
 - **Multiple output formats** — Terminal, JSON, and SARIF (for GitHub Code Scanning)
 - **Allow-list** — Suppress known false positives with expiry dates and audit trails
@@ -63,8 +104,21 @@ auditfix --remediate
 # CI mode (JSON output, no colors, strict exit codes)
 auditfix --ci
 
+# CI with custom fail strategy
+auditfix --ci --fail-on production-critical   # only fail on prod criticals
+auditfix --ci --fail-on any                   # fail on any vulnerability
+
+# Compare two scans (regression detection)
+auditfix diff baseline.json current.json
+
 # Check dependency licenses
 auditfix --check-licenses
+
+# Check for unmaintained packages
+auditfix --check-deps-age
+
+# Watch mode (re-scan on lockfile changes)
+auditfix --watch
 
 # Send results to Slack or webhook
 auditfix --webhook https://hooks.slack.com/services/T00/B00/xxx
@@ -104,6 +158,35 @@ auditfix ignore GHSA-xxxx-yyyy-zzzz \
 
 This creates a `.auditfixignore` file in your project root with an audit trail.
 
+## Scan Diff
+
+Compare two JSON reports to detect regressions:
+
+```bash
+# Save a baseline
+auditfix --json > baseline.json
+
+# After changes, compare
+auditfix --json > current.json
+auditfix diff baseline.json current.json
+```
+
+Output shows new vulnerabilities (red), fixed vulnerabilities (green), and unchanged. Exits 1 if regressions are found — useful for CI PR gating.
+
+## CI Exit Code Strategies
+
+Control when auditfix fails your CI pipeline:
+
+| Strategy | `--fail-on` value | Fails when |
+|----------|-------------------|------------|
+| Default | `production-high` | Production critical or high vulns |
+| Strict | `production-critical` | Only production critical vulns |
+| Zero tolerance | `any` | Any vulnerability at all |
+
+```bash
+auditfix --ci --fail-on production-critical
+```
+
 ## License Scanner
 
 Detect copyleft and problematic licenses in your dependency tree:
@@ -118,6 +201,26 @@ Flags:
 - **Unknown** (UNLICENSED) — No license specified
 
 Handles SPDX expressions: `(MIT OR GPL-3.0)` is OK because MIT is permissive.
+
+## Dependency Age Checker
+
+Flag packages with no npm updates in 2+ years:
+
+```bash
+auditfix --check-deps-age
+```
+
+Queries the npm registry for last publish dates. Helps identify abandoned or unmaintained dependencies.
+
+## Watch Mode
+
+Monitor lockfiles and automatically re-scan when they change:
+
+```bash
+auditfix --watch
+```
+
+Watches `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` in the project directory. Runs an initial scan, then re-scans whenever a lockfile is modified.
 
 ## Webhook Notifications
 
@@ -137,7 +240,7 @@ Slack messages include severity counts, top 5 vulnerabilities, and confidence le
 
 ### Terminal (default)
 
-Color-coded table with severity, package, version, risk score, and fix availability.
+Color-coded output with severity, package, version, risk score, and fix availability.
 
 ### JSON (`--json` or `--ci`)
 
@@ -197,6 +300,19 @@ jobs:
           sarif_file: results.sarif
 ```
 
+### PR regression gating
+
+Fail PRs that introduce new vulnerabilities:
+
+```yaml
+- name: Baseline scan
+  run: npx auditfix --json > baseline.json
+  continue-on-error: true
+
+- name: Check for regressions
+  run: npx auditfix diff baseline.json current.json
+```
+
 ### Auto-fix PR workflow
 
 Automatically create PRs with security fixes on a schedule. See [`examples/auto-fix-pr.yml`](examples/auto-fix-pr.yml).
@@ -220,7 +336,7 @@ auditfix ships as a reusable GitHub Action:
 | Code | Meaning |
 |------|---------|
 | 0 | No production vulnerabilities found |
-| 1 | Production vulnerabilities found |
+| 1 | Production vulnerabilities found (or regressions in `diff`) |
 | 2 | Error (missing lockfile, all advisory sources failed, etc.) |
 
 ## Configuration
