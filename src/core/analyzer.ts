@@ -9,12 +9,14 @@ import { resolveAdvisories, AdvisoryResolutionError } from './advisory/resolver.
 import { matchAdvisories } from './advisory/matcher.js';
 import { scoreAllMatches } from './advisory/scorer.js';
 import { loadLocalAllowList, applyAllowList } from './allowlist/local.js';
+import { detectWorkspaces, mapDepsToWorkspaces } from './workspace/detector.js';
 import * as logger from '../utils/logger.js';
 
 export type AnalyzeOptions = {
   projectDir: string;
   productionOnly: boolean;
   severityThreshold?: RiskScore['label'];
+  workspace?: string; // filter to a specific workspace
 };
 
 export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
@@ -29,10 +31,18 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     logger.debug(`Skipped ${lockfileResult.skipped.length} entries: ${lockfileResult.skipped.map(s => `${s.key} (${s.reason})`).join(', ')}`);
   }
 
-  // 2. Compute dependency paths
+  // 2. Detect workspaces
+  const wsConfig = detectWorkspaces(options.projectDir);
+  let depToWorkspaces: Map<string, Set<string>> | undefined;
+  if (wsConfig.isMonorepo) {
+    logger.info(`Monorepo detected: ${wsConfig.workspaces.length} workspaces`);
+    depToWorkspaces = mapDepsToWorkspaces(lockfileResult.graph, wsConfig.workspaces);
+  }
+
+  // 3. Compute dependency paths
   computeDependencyPaths(lockfileResult.graph);
 
-  // 3. Resolve advisories (three-tier fallback: OSV → cache → npm)
+  // 4. Resolve advisories (three-tier fallback: OSV → cache → npm)
   let advisorySource: string;
   let confidence: ConfidenceLevel;
   let advisoryCount: number;
@@ -75,12 +85,24 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     throw err;
   }
 
-  // 4. Match advisories to installed packages
+  // 5. Match advisories to installed packages
   logger.info('Matching advisories...');
   const allMatches = matchAdvisories(lockfileResult.graph, advisories);
+
+  // Annotate matches with workspace info
+  if (depToWorkspaces) {
+    for (const match of allMatches) {
+      const graphKey = `${match.package}@${match.installedVersion}`;
+      const ws = depToWorkspaces.get(graphKey);
+      if (ws && ws.size > 0) {
+        match.workspaces = [...ws];
+      }
+    }
+  }
+
   logger.info(`Found ${allMatches.length} vulnerability matches`);
 
-  // 5. Apply allow-list
+  // 6. Apply allow-list
   const allowList = loadLocalAllowList(options.projectDir);
   const { kept: matches, ignored } = applyAllowList(allMatches, allowList);
 
@@ -88,8 +110,15 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     logger.info(`${ignored.length} vulnerabilities suppressed by allow-list`);
   }
 
-  // 6. Score and sort
+  // 7. Score and sort
   let scored = scoreAllMatches(matches);
+
+  // Filter by workspace if requested
+  if (options.workspace) {
+    scored = scored.filter((s) =>
+      s.match.workspaces?.includes(options.workspace!) ?? false,
+    );
+  }
 
   // Filter production-only if requested
   if (options.productionOnly) {
@@ -125,6 +154,7 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     advisoryCount,
     confidence,
     scanDurationMs: Date.now() - startTime,
+    workspaceCount: wsConfig.isMonorepo ? wsConfig.workspaces.length : undefined,
   };
 
   return {

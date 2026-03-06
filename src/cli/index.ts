@@ -35,6 +35,7 @@ program
   .option('--sarif', 'Output as SARIF v2.1.0 JSON (for GitHub Code Scanning)', false)
   .option('--verbose', 'Enable debug logging', false)
   .option('--dir <path>', 'Project directory to scan', process.cwd())
+  .option('-w, --workspace <name>', 'Filter results to a specific workspace (monorepo)')
   .action(async (options) => {
     if (options.verbose) {
       setLogLevel('debug');
@@ -64,6 +65,7 @@ program
         projectDir: options.dir,
         productionOnly: config.productionOnly,
         severityThreshold: config.severity,
+        workspace: options.workspace,
       });
 
       if (config.output === 'sarif') {

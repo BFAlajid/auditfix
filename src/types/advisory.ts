@@ -71,4 +71,5 @@ export type AdvisoryMatch = {
   installedVersion: string;
   dependencyPath: string[];
   isProduction: boolean;
+  workspaces?: string[]; // workspace names that use this package
 };

@@ -87,6 +87,10 @@ function renderVulnerability(vuln: ScoredVulnerability): string {
 
   lines.push(`  Production: ${prodLabel} | Exploit: ${exploitLabel} | Fix: ${fixLabel}`);
 
+  if (match.workspaces && match.workspaces.length > 0) {
+    lines.push(`  Workspaces: ${chalk.cyan(match.workspaces.join(', '))}`);
+  }
+
   if (risk.factors.fixVersion && match.isProduction) {
     lines.push(chalk.cyan(`  → Run \`auditfix --fix\` to auto-patch`));
   } else if (!match.isProduction) {
@@ -103,7 +107,8 @@ function renderMetadata(report: AuditReport): string {
   const skippedInfo = metadata.skippedPackages > 0
     ? ` | Skipped: ${metadata.skippedPackages}`
     : '';
-  lines.push(chalk.dim(`Scanned: ${metadata.totalPackages} packages${skippedInfo}`));
+  const wsInfo = metadata.workspaceCount ? ` | Workspaces: ${metadata.workspaceCount}` : '';
+  lines.push(chalk.dim(`Scanned: ${metadata.totalPackages} packages${skippedInfo}${wsInfo}`));
   lines.push(chalk.dim(`Advisory source: ${metadata.advisorySource} | Matched against: ${metadata.advisoryCount} advisories`));
 
   const confidenceColor = metadata.confidence === 'HIGH' ? chalk.green

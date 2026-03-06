@@ -30,6 +30,7 @@ export type ScanMetadata = {
   advisoryCount: number;
   confidence: ConfidenceLevel;
   scanDurationMs: number;
+  workspaceCount?: number;
 };
 
 export type AuditReport = {

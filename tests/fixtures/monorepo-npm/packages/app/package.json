@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.17.1",
+    "@fixture/utils": "1.0.0"
+  }
+}
