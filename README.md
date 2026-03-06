@@ -1,5 +1,8 @@
 # auditfix
 
+[![CI](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml/badge.svg)](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/auditfix)](https://www.npmjs.com/package/auditfix)
+
 Smarter npm dependency security CLI. Replaces `npm audit` with production reachability analysis, risk scoring, and safe auto-fixes.
 
 ## Why auditfix?
@@ -84,14 +87,38 @@ SARIF v2.1.0 output for GitHub Code Scanning integration:
 auditfix --sarif > results.sarif
 ```
 
-Upload to GitHub:
+Full GitHub Actions workflow (copy to `.github/workflows/auditfix.yml`):
 
 ```yaml
-# .github/workflows/security.yml
-- run: npx auditfix --sarif > results.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: results.sarif
+name: Security Audit
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  security-events: write
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - name: Run auditfix
+        run: npx auditfix --sarif > results.sarif
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
 ```
 
 ## Exit Codes
