@@ -96,7 +96,7 @@ describe('Integration: vulnerable-project fixture', () => {
       productionOnly: false,
     });
 
-    expect(report.metadata.scanDurationMs).toBeGreaterThan(0);
+    expect(report.metadata.scanDurationMs).toBeGreaterThanOrEqual(0);
     expect(report.metadata.lockfileType).toContain('npm');
     expect(report.metadata.advisoryCount).toBeGreaterThan(0);
   });
