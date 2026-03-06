@@ -3,6 +3,7 @@
  * Produces a minimal but valid CycloneDX JSON SBOM from the dependency graph.
  */
 import type { DependencyGraph } from '../../types/package.js';
+import { randomUUID } from 'node:crypto';
 
 const CYCLONEDX_SPEC = '1.5';
 const CYCLONEDX_FORMAT = 'CycloneDX';
@@ -61,7 +62,7 @@ export function generateSbom(
   const sbom = {
     bomFormat: CYCLONEDX_FORMAT,
     specVersion: CYCLONEDX_SPEC,
-    serialNumber: `urn:uuid:${crypto.randomUUID()}`,
+    serialNumber: `urn:uuid:${randomUUID()}`,
     version: 1,
     metadata: {
       timestamp: new Date().toISOString(),
