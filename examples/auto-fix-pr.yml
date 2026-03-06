@@ -1,0 +1,37 @@
+# Example GitHub Actions workflow for automatic security fix PRs.
+# Copy this to .github/workflows/auditfix-auto-fix.yml in your repo.
+name: Auto-fix Security Vulnerabilities
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Every Monday at 8am UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+
+      - name: Run auditfix with auto-fix
+        run: |
+          npm install -g auditfix@latest
+          npx auditfix --fix --create-pr --sarif > results.sarif || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+        continue-on-error: true

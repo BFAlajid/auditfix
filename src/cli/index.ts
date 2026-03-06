@@ -17,6 +17,8 @@ import { generateRemediationPlan } from '../core/fixer/remediation.js';
 import { createFixPr } from '../core/fixer/pr-creator.js';
 import { detectAndParseLockfile } from '../core/lockfile/parser.js';
 import { scanInstallScripts } from '../core/scanner/install-scripts.js';
+import { scanLicenses } from '../core/scanner/license-checker.js';
+import { sendWebhook } from '../core/notify/webhook.js';
 import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
 import * as logger from '../utils/logger.js';
@@ -46,12 +48,20 @@ program
   .option('--scan-scripts', 'Scan for suspicious install scripts', false)
   .option('--remediate', 'Show guided remediation plan', false)
   .option('--create-pr', 'Create a GitHub PR with fixes (requires gh CLI)', false)
+  .option('--ci', 'CI mode: no colors, minimal output, strict exit codes', false)
+  .option('--check-licenses', 'Scan dependencies for copyleft/problematic licenses', false)
+  .option('--webhook <url>', 'Send results to a webhook URL (Slack or generic)')
   .option('--verbose', 'Enable debug logging', false)
   .option('--dir <path>', 'Project directory to scan', process.cwd())
   .option('-w, --workspace <name>', 'Filter results to a specific workspace (monorepo)')
   .action(async (options) => {
     if (options.verbose) {
       setLogLevel('debug');
+    }
+
+    // CI mode: disable colors, force JSON output
+    if (options.ci) {
+      chalk.level = 0;
     }
 
     // H1: Validate --dir exists and is a directory
@@ -101,9 +111,12 @@ program
         workspace: options.workspace,
       });
 
-      if (config.output === 'sarif') {
+      // CI mode forces JSON output
+      const outputFormat = options.ci ? 'json' : config.output;
+
+      if (outputFormat === 'sarif') {
         console.log(renderSarifReport(report, VERSION));
-      } else if (config.output === 'json') {
+      } else if (outputFormat === 'json') {
         console.log(renderJsonReport(report));
       } else {
         console.log(renderTerminalReport(report, VERSION));
@@ -123,6 +136,38 @@ program
               console.log(chalk.dim(`    - ${r}`));
             }
           }
+        }
+      }
+
+      // Check licenses if requested
+      if (options.checkLicenses) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        const licenseFindings = scanLicenses(lockfileResult.graph, options.dir);
+        if (licenseFindings.length > 0) {
+          console.log('');
+          console.log(chalk.bold.yellow(`⚠ ${licenseFindings.length} license concerns detected:`));
+          for (const f of licenseFindings) {
+            const scope = f.isProduction ? chalk.red('PROD') : chalk.dim('dev');
+            const cat = f.category === 'network-copyleft' ? chalk.red(f.category) :
+                        f.category === 'copyleft' ? chalk.yellow(f.category) :
+                        chalk.dim(f.category);
+            console.log(`  ${scope} ${chalk.bold(f.package)}@${f.version} — ${f.license} (${cat})`);
+          }
+        } else {
+          console.log(chalk.green('\nNo license concerns detected.'));
+        }
+      }
+
+      // Send webhook notification if URL provided
+      if (options.webhook) {
+        let projectName: string | undefined;
+        try {
+          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
+          projectName = pkg.name;
+        } catch { /* optional */ }
+        const webhookResult = await sendWebhook(options.webhook, report, projectName);
+        if (!webhookResult.success) {
+          logger.warn(`Webhook notification failed: ${webhookResult.error}`);
         }
       }
 
@@ -202,6 +247,18 @@ program
     });
 
     console.log(`Added ${advisoryId} (${options.package}) to .auditfixignore — expires ${options.expires}`);
+  });
+
+program
+  .command('update-index')
+  .description('Update the bundled offline advisory index from OSV.dev (requires network)')
+  .action(async () => {
+    console.log('The offline advisory index is bundled at build time.');
+    console.log('To get the latest advisories, update auditfix:');
+    console.log('  npm install -g auditfix@latest');
+    console.log('');
+    console.log('The index is a last-resort fallback. For real-time data, auditfix');
+    console.log('queries OSV.dev API directly (Tier 1) on every scan.');
   });
 
 async function runFix(projectDir: string, report: import('../types/report.js').AuditReport): Promise<import('../core/fixer/lockfile-writer.js').FixResult | null> {

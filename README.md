@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml/badge.svg)](https://github.com/BFAlajid/auditfix/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/auditfix)](https://www.npmjs.com/package/auditfix)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Smarter npm dependency security CLI. Replaces `npm audit` with production reachability analysis, risk scoring, and safe auto-fixes.
 
@@ -10,14 +11,19 @@ Smarter npm dependency security CLI. Replaces `npm audit` with production reacha
 `npm audit` is noisy. It flags every advisory regardless of whether the vulnerable package is even reachable in production. auditfix solves this by:
 
 - **Production reachability** — Only flags vulnerabilities in packages your production code actually uses
+- **Import chain analysis** — Static analysis of import/require statements to verify packages are actually imported
 - **Risk scoring** — Composite score (0-100) based on CVSS, production exposure, exploit availability, and fix availability
 - **Safe auto-fix** — Automatically applies non-breaking updates via lockfile overrides (npm, yarn, pnpm)
 - **Multi-lockfile support** — npm, yarn (classic + berry), and pnpm
 - **Monorepo support** — Workspace detection with per-workspace vulnerability mapping
 - **CycloneDX SBOM** — Generate a CycloneDX 1.5 Software Bill of Materials
 - **Install script scanner** — Detect suspicious `postinstall`/`preinstall` scripts
+- **License scanner** — Detect copyleft and incompatible licenses in dependencies
 - **Guided remediation** — Holistic fix plans ranked by impact
 - **GitHub PR creation** — Automatically create PRs with security fixes
+- **Webhook notifications** — Post scan results to Slack or any webhook endpoint
+- **CI mode** — Machine-friendly JSON output with no colors for CI pipelines
+- **Offline mode** — Bundled advisory index works with zero network access
 - **Multiple output formats** — Terminal, JSON, and SARIF (for GitHub Code Scanning)
 - **Allow-list** — Suppress known false positives with expiry dates and audit trails
 
@@ -54,6 +60,15 @@ auditfix --fix --create-pr
 # Show guided remediation plan
 auditfix --remediate
 
+# CI mode (JSON output, no colors, strict exit codes)
+auditfix --ci
+
+# Check dependency licenses
+auditfix --check-licenses
+
+# Send results to Slack or webhook
+auditfix --webhook https://hooks.slack.com/services/T00/B00/xxx
+
 # Generate CycloneDX SBOM
 auditfix --sbom > sbom.json
 
@@ -84,10 +99,39 @@ Suppress known false positives with `.auditfixignore`:
 auditfix ignore GHSA-xxxx-yyyy-zzzz \
   --package lodash \
   --reason "Not reachable in our usage" \
-  --expires 2025-12-31
+  --expires 2026-12-31
 ```
 
 This creates a `.auditfixignore` file in your project root with an audit trail.
+
+## License Scanner
+
+Detect copyleft and problematic licenses in your dependency tree:
+
+```bash
+auditfix --check-licenses
+```
+
+Flags:
+- **Network copyleft** (AGPL, SSPL) — SaaS counts as distribution
+- **Copyleft** (GPL, LGPL, MPL, EPL) — Derivative works must use same license
+- **Unknown** (UNLICENSED) — No license specified
+
+Handles SPDX expressions: `(MIT OR GPL-3.0)` is OK because MIT is permissive.
+
+## Webhook Notifications
+
+Send scan results to Slack or any HTTP endpoint:
+
+```bash
+# Slack incoming webhook
+auditfix --webhook https://hooks.slack.com/services/T00/B00/xxx
+
+# Generic webhook (receives JSON payload)
+auditfix --webhook https://your-server.com/audit-hook
+```
+
+Slack messages include severity counts, top 5 vulnerabilities, and confidence level.
 
 ## Output Formats
 
@@ -95,7 +139,7 @@ This creates a `.auditfixignore` file in your project root with an audit trail.
 
 Color-coded table with severity, package, version, risk score, and fix availability.
 
-### JSON (`--json`)
+### JSON (`--json` or `--ci`)
 
 Machine-readable output for CI pipelines and scripting.
 
@@ -115,9 +159,11 @@ Generate a CycloneDX 1.5 Software Bill of Materials:
 auditfix --sbom > sbom.json
 ```
 
-### GitHub Actions Workflow
+## GitHub Actions
 
-Full GitHub Actions workflow (copy to `.github/workflows/auditfix.yml`):
+### Basic SARIF workflow
+
+Copy to `.github/workflows/auditfix.yml`:
 
 ```yaml
 name: Security Audit
@@ -151,6 +197,24 @@ jobs:
           sarif_file: results.sarif
 ```
 
+### Auto-fix PR workflow
+
+Automatically create PRs with security fixes on a schedule. See [`examples/auto-fix-pr.yml`](examples/auto-fix-pr.yml).
+
+### Composite Action
+
+auditfix ships as a reusable GitHub Action:
+
+```yaml
+- uses: BFAlajid/auditfix@v1
+  with:
+    severity: high
+    production-only: true
+    auto-fix: true
+    sarif: true
+    webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -180,11 +244,12 @@ CLI flags override config file values.
 1. **Parse lockfile** — Reads `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`
 2. **Build dependency graph** — Maps all packages with production/dev classification
 3. **Detect workspaces** — npm/yarn workspaces and pnpm-workspace.yaml
-4. **Fetch advisories** — Three-tier fallback: OSV.dev API, local cache (4hr TTL, HMAC-verified), npm bulk endpoint
-5. **Match vulnerabilities** — Checks installed versions against advisory semver ranges
-6. **Score risks** — Composite scoring: CVSS base (40%), production reachability (30%), exploit status (15%), fix availability (10%), dependency depth (5%)
-7. **Apply allow-list** — Filters out suppressed advisories with alias matching (GHSA/CVE cross-reference)
-8. **Auto-fix** (with `--fix`) — Applies safe updates via npm overrides, yarn resolutions, or pnpm.overrides
+4. **Scan import chains** — Static analysis of import/require to determine reachability
+5. **Fetch advisories** — Four-tier fallback: OSV.dev API, local cache (4hr TTL, HMAC-verified), bundled offline index, npm bulk endpoint
+6. **Match vulnerabilities** — Checks installed versions against advisory semver ranges
+7. **Score risks** — Composite scoring: CVSS base (40%), production reachability (30%), import chain (+10%), exploit status (15%), fix availability (10%), dependency depth (5%)
+8. **Apply allow-list** — Filters out suppressed advisories with alias matching (GHSA/CVE cross-reference)
+9. **Auto-fix** (with `--fix`) — Applies safe updates via npm overrides, yarn resolutions, or pnpm.overrides
 
 ## Supported Lockfiles
 
