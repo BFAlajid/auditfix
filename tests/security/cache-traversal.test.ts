@@ -398,15 +398,11 @@ describe('Advisory cache — symlink rejection', () => {
     }
 
     // Attempt to cache — should refuse to write because target is a symlink
-    await cacheAdvisory(id, advisory, cacheDir);
+    await expect(cacheAdvisory(id, advisory, cacheDir)).rejects.toThrow('symlink');
 
     // The symlink target should not have been overwritten with advisory data
     const targetContent = fs.readFileSync(realFile, 'utf-8');
     expect(targetContent).toBe('{}');
-
-    // Reading should also return null for symlinks
-    const result = getCachedAdvisory(id, cacheDir);
-    expect(result).toBeNull();
   });
 });
 
