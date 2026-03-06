@@ -178,48 +178,65 @@ export function mapDepsToWorkspaces(
   graph: import('../../types/package.js').DependencyGraph,
   workspaces: WorkspaceInfo[],
 ): Map<string, Set<string>> {
+  if (workspaces.length === 0) return new Map();
+
   const depToWorkspaces = new Map<string, Set<string>>();
+
+  // Build name-to-keys index for O(1) lookup (was O(N) per dep)
+  const nameIndex = new Map<string, string[]>();
+  for (const [graphKey, node] of graph) {
+    const keys = nameIndex.get(node.name);
+    if (keys) {
+      keys.push(graphKey);
+    } else {
+      nameIndex.set(node.name, [graphKey]);
+    }
+  }
+
+  // Memoize transitive dep sets per graph key
+  const transitiveCache = new Map<string, Set<string>>();
+
+  function getTransitiveDeps(graphKey: string): Set<string> {
+    if (transitiveCache.has(graphKey)) return transitiveCache.get(graphKey)!;
+
+    const result = new Set<string>();
+    transitiveCache.set(graphKey, result); // set early to handle cycles
+
+    const node = graph.get(graphKey);
+    if (!node) return result;
+
+    for (const depKey of node.dependencies) {
+      result.add(depKey);
+      for (const transKey of getTransitiveDeps(depKey)) {
+        result.add(transKey);
+      }
+    }
+    return result;
+  }
 
   for (const ws of workspaces) {
     const allDeps = { ...ws.dependencies, ...ws.devDependencies };
 
-    for (const [depName] of Object.entries(allDeps)) {
-      // Find matching graph nodes for this dependency
-      for (const [graphKey, node] of graph) {
-        if (node.name === depName) {
-          if (!depToWorkspaces.has(graphKey)) {
-            depToWorkspaces.set(graphKey, new Set());
-          }
-          depToWorkspaces.get(graphKey)!.add(ws.name);
+    for (const depName of Object.keys(allDeps)) {
+      const candidates = nameIndex.get(depName);
+      if (!candidates) continue;
 
-          // Also map transitive deps of this node to this workspace
-          mapTransitiveDeps(graph, graphKey, ws.name, depToWorkspaces, new Set());
+      for (const graphKey of candidates) {
+        if (!depToWorkspaces.has(graphKey)) {
+          depToWorkspaces.set(graphKey, new Set());
+        }
+        depToWorkspaces.get(graphKey)!.add(ws.name);
+
+        // Map transitive deps using memoized set
+        for (const transKey of getTransitiveDeps(graphKey)) {
+          if (!depToWorkspaces.has(transKey)) {
+            depToWorkspaces.set(transKey, new Set());
+          }
+          depToWorkspaces.get(transKey)!.add(ws.name);
         }
       }
     }
   }
 
   return depToWorkspaces;
-}
-
-function mapTransitiveDeps(
-  graph: import('../../types/package.js').DependencyGraph,
-  graphKey: string,
-  workspaceName: string,
-  depToWorkspaces: Map<string, Set<string>>,
-  visited: Set<string>,
-): void {
-  if (visited.has(graphKey)) return;
-  visited.add(graphKey);
-
-  const node = graph.get(graphKey);
-  if (!node) return;
-
-  for (const depKey of node.dependencies) {
-    if (!depToWorkspaces.has(depKey)) {
-      depToWorkspaces.set(depKey, new Set());
-    }
-    depToWorkspaces.get(depKey)!.add(workspaceName);
-    mapTransitiveDeps(graph, depKey, workspaceName, depToWorkspaces, visited);
-  }
 }

@@ -17,6 +17,9 @@ const TOKEN_PATTERNS = [
   /github_pat_[A-Za-z0-9_]{82,}/g,
   /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /Authorization:\s*[^\s]+/gi,
+  /npm_[A-Za-z0-9]{36,}/g,           // npm tokens
+  /glpat-[A-Za-z0-9_-]{20,}/g,       // GitLab PATs
+  /AKIA[A-Z0-9]{16}/g,               // AWS access keys
 ];
 
 function redact(message: string): string {

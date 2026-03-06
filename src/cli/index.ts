@@ -2,7 +2,8 @@
  * auditfix CLI entry point.
  * Commander-based arg parsing with exitOverride for testing.
  */
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
+import { existsSync, statSync } from 'node:fs';
 import { analyze } from '../core/analyzer.js';
 import { loadConfig } from '../core/config.js';
 import { renderTerminalReport, getExitCode } from './output/terminal.js';
@@ -16,12 +17,16 @@ import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
 import * as logger from '../utils/logger.js';
 import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
 import { join } from 'node:path';
 import { safeJsonParse } from '../utils/sanitize.js';
 import chalk from 'chalk';
 
-const VERSION = '1.0.1';
+const VERSION = process.env.AUDITFIX_VERSION ?? '1.0.1';
 
+const SEVERITY_CHOICES = ['critical', 'high', 'medium', 'low', 'info'];
+
+export function createProgram(): Command {
 const program = new Command();
 
 program
@@ -29,7 +34,7 @@ program
   .description('Smarter npm dependency security CLI — production reachability, actionable fixes, noise-free reports')
   .version(VERSION)
   .option('--prod-only', 'Only show production vulnerabilities', false)
-  .option('--severity <level>', 'Minimum severity threshold (critical, high, medium, low, info)')
+  .addOption(new Option('--severity <level>', 'Minimum severity threshold').choices(SEVERITY_CHOICES))
   .option('--fix', 'Auto-fix safe (non-breaking) updates', false)
   .option('--json', 'Output as JSON', false)
   .option('--sarif', 'Output as SARIF v2.1.0 JSON (for GitHub Code Scanning)', false)
@@ -40,6 +45,14 @@ program
     if (options.verbose) {
       setLogLevel('debug');
     }
+
+    // H1: Validate --dir exists and is a directory
+    const dir = path.resolve(options.dir);
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+      logger.error(`--dir path does not exist or is not a directory: ${options.dir}`);
+      process.exit(2);
+    }
+    options.dir = dir;
 
     try {
       // Build CLI overrides from explicitly-set flags only.
@@ -142,9 +155,11 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
 
   // Parse lockfile to get dependency graph
   let graph: import('../types/package.js').DependencyGraph;
+  let lockfileType: import('../types/package.js').LockfileType | undefined;
   try {
     const lockfileResult = detectAndParseLockfile(projectDir);
     graph = lockfileResult.graph;
+    lockfileType = lockfileResult.type;
   } catch {
     logger.warn('Could not parse lockfile for fix analysis');
     return;
@@ -171,7 +186,7 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
     console.log(`  ${s.packageName} ${s.currentVersion} → ${chalk.green(s.fixVersion)}`);
   }
 
-  const result = await applyFixes(projectDir, plan.safe);
+  const result = await applyFixes(projectDir, plan.safe, lockfileType);
 
   if (result.applied.length > 0) {
     console.log(chalk.green(`\nFixed ${result.applied.length} vulnerabilities.`));
@@ -199,4 +214,8 @@ function getDefaultExpiry(): string {
   return date.toISOString().split('T')[0];
 }
 
-program.parse();
+return program;
+}
+
+// Auto-parse when run as CLI entry point
+createProgram().parse();

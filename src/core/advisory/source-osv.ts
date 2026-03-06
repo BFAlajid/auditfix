@@ -15,6 +15,7 @@ import type {
   Advisory,
 } from '../../types/advisory.js';
 import { affectedToSemverRange, affectedFixVersion } from './osv-ranges.js';
+import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
 
 const OSV_BATCH_URL = 'https://api.osv.dev/v1/querybatch';
@@ -187,5 +188,5 @@ async function fetchWithValidation(url: string, init: RequestInit, maxSize: numb
     throw new Error(`Response body too large: ${text.length} chars (max ${maxSize})`);
   }
 
-  return JSON.parse(text);
+  return safeJsonParse(text);
 }

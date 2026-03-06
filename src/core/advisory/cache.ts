@@ -18,7 +18,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import type { Advisory } from '../../types/advisory.js';
-import { isValidAdvisoryId } from '../../utils/sanitize.js';
+import { isValidAdvisoryId, safeJsonParse } from '../../utils/sanitize.js';
 
 const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const HMAC_ALGORITHM = 'sha256';
@@ -200,7 +200,7 @@ function readVerifiedEntry(filePath: string, hmacKey: Buffer): CacheEntry | null
     if (isSymlink(filePath)) return null;
 
     const raw = fs.readFileSync(filePath, 'utf-8');
-    const entry: CacheEntry = JSON.parse(raw);
+    const entry = safeJsonParse<CacheEntry>(raw);
 
     // Verify required fields exist
     if (

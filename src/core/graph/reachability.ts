@@ -30,9 +30,10 @@ export function markProductionReachable(
   // BFS with visited set (handles circular dependencies)
   const visited = new Set<string>();
   const queue = [...rootKeys];
+  let qi = 0;
 
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  while (qi < queue.length) {
+    const current = queue[qi++];
     if (visited.has(current)) continue;
     visited.add(current);
 
@@ -76,9 +77,10 @@ export function computeDependencyPaths(graph: DependencyGraph): void {
 
   const queue = [...roots];
   for (const key of roots) visited.add(key);
+  let qi2 = 0;
 
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  while (qi2 < queue.length) {
+    const current = queue[qi2++];
     const node = graph.get(current)!;
 
     for (const depKey of node.dependencies) {

@@ -126,6 +126,17 @@ export function parseNpmLockfile(content: string): {
     }
   }
 
+  // Build name-to-keys index for O(1) edge resolution (was O(N) per edge)
+  const nameIndex = new Map<string, string[]>();
+  for (const [graphKey, node] of graph) {
+    const keys = nameIndex.get(node.name);
+    if (keys) {
+      keys.push(graphKey);
+    } else {
+      nameIndex.set(node.name, [graphKey]);
+    }
+  }
+
   // Second pass: resolve dependency edges
   for (const [pathKey, entry] of Object.entries(packages)) {
     if (pathKey === '' || !entry.version) continue;
@@ -137,8 +148,7 @@ export function parseNpmLockfile(content: string): {
 
     if (entry.dependencies) {
       for (const [depName, depRange] of Object.entries(entry.dependencies)) {
-        // Find the resolved version of this dependency in the graph
-        const resolvedDep = findResolvedDep(graph, depName, depRange);
+        const resolvedDep = findResolvedDep(graph, nameIndex, depName, depRange);
         if (resolvedDep) {
           node.dependencies.push(resolvedDep);
         }
@@ -166,19 +176,17 @@ function countDepth(pathKey: string): number {
   return (pathKey.match(/node_modules\//g) || []).length;
 }
 
-/** Find a resolved dependency in the graph by name + range match */
-function findResolvedDep(graph: DependencyGraph, name: string, range: string): string | null {
+/** Find a resolved dependency in the graph by name + range match using name index */
+function findResolvedDep(graph: DependencyGraph, nameIndex: Map<string, string[]>, name: string, range: string): string | null {
+  const candidates = nameIndex.get(name);
+  if (!candidates) return null;
+
   let fallback: string | null = null;
-
-  for (const [key, node] of graph) {
-    if (node.name !== name) continue;
-
-    // Try semver range match first
+  for (const key of candidates) {
+    const node = graph.get(key)!;
     if (satisfiesRange(node.version, range)) {
       return key;
     }
-
-    // Keep first name match as fallback (handles non-semver ranges)
     if (!fallback) {
       fallback = key;
     }

@@ -37,7 +37,7 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
   try {
     const osvResult = await fetchOsvAdvisories(graph);
 
-    if (osvResult.errors.length === 0 && osvResult.advisories.size >= 0) {
+    if (osvResult.errors.length === 0 && osvResult.advisories.size > 0) {
       // Cache results for future runs (background, don't block)
       cacheAdvisoryBatch(osvResult.advisories).catch((err) => {
         logger.debug(`Cache write failed: ${err}`);

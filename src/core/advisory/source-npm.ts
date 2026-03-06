@@ -8,6 +8,7 @@
  */
 import type { DependencyGraph } from '../../types/package.js';
 import type { Advisory } from '../../types/advisory.js';
+import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
 
 const NPM_BULK_URL =
@@ -213,7 +214,7 @@ export async function fetchNpmAdvisories(
   // Parse JSON — npm outages may return HTML with 200 status
   let parsed: NpmBulkResponse;
   try {
-    parsed = JSON.parse(text) as NpmBulkResponse;
+    parsed = safeJsonParse<NpmBulkResponse>(text);
   } catch (err) {
     const preview = text.slice(0, 200);
     errors.push(

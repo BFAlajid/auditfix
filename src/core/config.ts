@@ -6,6 +6,7 @@
 import { lilconfig } from 'lilconfig';
 import type { AuditfixConfig } from '../types/config.js';
 import { DEFAULT_CONFIG } from '../types/config.js';
+import { safeYamlParse } from '../utils/sanitize.js';
 import * as logger from '../utils/logger.js';
 
 /**
@@ -43,7 +44,20 @@ export async function loadConfig(
   let fileConfig: Partial<AuditfixConfig> = {};
 
   try {
-    const searcher = lilconfig('auditfix');
+    const yamlLoader = (_filepath: string, content: string) => safeYamlParse(content);
+    const searcher = lilconfig('auditfix', {
+      searchPlaces: [
+        '.auditfixrc',
+        '.auditfixrc.json',
+        '.auditfixrc.yml',
+        '.auditfixrc.yaml',
+        'package.json',
+      ],
+      loaders: {
+        '.yml': yamlLoader,
+        '.yaml': yamlLoader,
+      },
+    });
     const result = await searcher.search(projectDir);
 
     if (result && !result.isEmpty) {

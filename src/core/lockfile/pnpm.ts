@@ -284,8 +284,9 @@ function propagateReachability(graph: DependencyGraph): void {
   }
 
   // BFS: mark all reachable from production as production
-  while (queue.length > 0) {
-    const key = queue.shift()!;
+  let qi = 0;
+  while (qi < queue.length) {
+    const key = queue[qi++];
     const node = graph.get(key);
     if (!node) continue;
 

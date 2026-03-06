@@ -78,6 +78,7 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
           advisoryCount: 0,
           confidence: 'UNRELIABLE',
           scanDurationMs: Date.now() - startTime,
+          lockfileType: lockfileResult.type,
         },
         ignored: [],
       };
@@ -155,6 +156,7 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     confidence,
     scanDurationMs: Date.now() - startTime,
     workspaceCount: wsConfig.isMonorepo ? wsConfig.workspaces.length : undefined,
+    lockfileType: lockfileResult.type,
   };
 
   return {

@@ -31,6 +31,7 @@ export type ScanMetadata = {
   confidence: ConfidenceLevel;
   scanDurationMs: number;
   workspaceCount?: number;
+  lockfileType?: string;
 };
 
 export type AuditReport = {

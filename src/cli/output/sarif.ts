@@ -49,10 +49,12 @@ function buildMessage(vuln: ScoredVulnerability): string {
 }
 
 /**
- * Determine the lockfile URI for artifact location.
- * Uses "package-lock.json" as the default lockfile path.
+ * Determine the lockfile URI for artifact location from report metadata.
  */
-function getLockfileUri(): string {
+function getLockfileUri(report: AuditReport): string {
+  const type = report.metadata?.lockfileType;
+  if (type?.startsWith('pnpm')) return 'pnpm-lock.yaml';
+  if (type?.startsWith('yarn')) return 'yarn.lock';
   return 'package-lock.json';
 }
 
@@ -123,7 +125,7 @@ export function renderSarifReport(report: AuditReport, version: string): string 
   }
 
   const rules: SarifRule[] = Array.from(ruleMap.values());
-  const lockfileUri = getLockfileUri();
+  const lockfileUri = getLockfileUri(report);
 
   // Build results
   const results: SarifResult[] = report.vulnerabilities.map((vuln) => {

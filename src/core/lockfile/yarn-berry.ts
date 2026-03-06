@@ -219,8 +219,9 @@ function classifyReachability(
       }
     }
 
-    while (queue.length > 0) {
-      const { key, depth } = queue.shift()!;
+    let qi = 0;
+    while (qi < queue.length) {
+      const { key, depth } = queue[qi++];
       const node = graph.get(key);
       if (!node) continue;
 

@@ -144,7 +144,6 @@ function hasExploitIndicator(urls: string[]): boolean {
     'exploit-db.com',
     'packetstormsecurity.com',
     '/cisa.gov/known-exploited',
-    'github.com/advisories',
   ];
 
   return urls.some((url) =>

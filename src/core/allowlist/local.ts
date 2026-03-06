@@ -2,7 +2,7 @@
  * Local allow-list (.auditfixignore).
  * Project-level vulnerability suppression with mandatory expiry dates.
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AllowList, AllowListEntry } from './types.js';
 import type { AdvisoryMatch } from '../../types/advisory.js';
@@ -146,6 +146,11 @@ export function addToAllowList(
     );
   } else {
     allowList.ignore.push(entry);
+  }
+
+  // H2: Reject writing to symlinks
+  if (existsSync(filePath) && lstatSync(filePath).isSymbolicLink()) {
+    throw new Error(`Refusing to write to symlink: ${filePath}`);
   }
 
   writeFileSync(filePath, JSON.stringify(allowList, null, 2) + '\n', 'utf-8');

@@ -1,14 +1,17 @@
 /**
  * Lockfile writer.
- * Applies safe updates by writing npm overrides to package.json,
- * then running `npm install --package-lock-only` to regenerate the lockfile.
+ * Applies safe updates via package manager-specific override mechanisms:
+ * - npm: `overrides` in package.json + `npm install --package-lock-only`
+ * - yarn: `resolutions` in package.json + `yarn install`
+ * - pnpm: `pnpm.overrides` in package.json + `pnpm install --lockfile-only`
  *
  * Security (S3): All shell commands use execFile with argument arrays.
  * Overrides are written via JSON.stringify only — never string interpolation.
  */
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SafeUpdate } from './safe-update.js';
+import type { LockfileType } from '../../types/package.js';
 import { safeExec, validateFixInputs } from '../../utils/shell.js';
 import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
@@ -30,15 +33,22 @@ export type FailedFix = {
 };
 
 /**
+ * Detect the lockfile type in a project directory.
+ */
+function detectLockfileType(projectDir: string): LockfileType {
+  if (existsSync(join(projectDir, 'pnpm-lock.yaml'))) return 'pnpm-v9';
+  if (existsSync(join(projectDir, 'yarn.lock'))) return 'yarn-classic';
+  return 'npm-v3';
+}
+
+/**
  * Apply safe updates to the project.
- * 1. Write overrides to package.json
- * 2. Run npm install --package-lock-only
- * 3. Remove overrides from package.json
- * 4. Return results
+ * Detects the package manager and uses the appropriate override mechanism.
  */
 export async function applyFixes(
   projectDir: string,
   updates: SafeUpdate[],
+  lockfileType?: LockfileType,
 ): Promise<FixResult> {
   if (updates.length === 0) {
     return { applied: [], failed: [] };
@@ -61,6 +71,14 @@ export async function applyFixes(
     }
   }
 
+  // H3: Reject writing to symlinked package.json
+  try {
+    if (lstatSync(packageJsonPath).isSymbolicLink()) {
+      failed.push({ packageName: '*', reason: 'Refusing to write to symlinked package.json' });
+      return { applied, failed };
+    }
+  } catch { /* file doesn't exist yet — that's fine, will fail below */ }
+
   // Read original package.json
   let originalContent: string;
   let packageJson: Record<string, unknown>;
@@ -81,39 +99,41 @@ export async function applyFixes(
     overrides[update.packageName] = update.fixVersion;
   }
 
-  // Write overrides to package.json (safely via JSON.stringify)
-  const existingOverrides = (packageJson.overrides as Record<string, string>) ?? {};
-  packageJson.overrides = { ...existingOverrides, ...overrides };
+  // Detect package manager strategy
+  const type = lockfileType ?? detectLockfileType(projectDir);
+  const strategy = getOverrideStrategy(type);
+
+  // Write overrides using the correct strategy
+  const existingOverrides = strategy.getExisting(packageJson);
+  strategy.setOverrides(packageJson, { ...existingOverrides, ...overrides });
 
   try {
     writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf-8');
-    logger.debug(`Wrote ${Object.keys(overrides).length} overrides to package.json`);
+    logger.debug(`Wrote ${Object.keys(overrides).length} overrides to package.json (${strategy.name})`);
   } catch (err) {
     failed.push({
       packageName: '*',
       reason: `Failed to write package.json: ${err instanceof Error ? err.message : err}`,
     });
-    // Restore original
     writeFileSync(packageJsonPath, originalContent, 'utf-8');
     return { applied, failed };
   }
 
-  // Run npm install --package-lock-only
-  logger.info('Running npm install --package-lock-only...');
-  const result = await safeExec('npm', ['install', '--package-lock-only'], {
+  // Run the appropriate install command
+  logger.info(`Running ${strategy.installCmd.join(' ')}...`);
+  const result = await safeExec(strategy.installCmd[0], strategy.installCmd.slice(1), {
     cwd: projectDir,
     timeout: 120_000,
   });
 
   if (result.exitCode !== 0) {
-    logger.warn(`npm install failed (exit ${result.exitCode}): ${result.stderr}`);
-    // Restore original package.json
+    logger.warn(`Install failed (exit ${result.exitCode}): ${result.stderr}`);
     writeFileSync(packageJsonPath, originalContent, 'utf-8');
 
     for (const update of updates) {
       failed.push({
         packageName: update.packageName,
-        reason: `npm install failed: ${result.stderr.slice(0, 200)}`,
+        reason: `Install failed: ${result.stderr.slice(0, 200)}`,
       });
     }
 
@@ -129,14 +149,75 @@ export async function applyFixes(
     });
   }
 
-  // Clean up: remove our overrides (restore original overrides if any)
+  // Clean up: restore original overrides
   if (Object.keys(existingOverrides).length > 0) {
-    packageJson.overrides = existingOverrides;
+    strategy.setOverrides(packageJson, existingOverrides);
   } else {
-    delete packageJson.overrides;
+    strategy.removeOverrides(packageJson);
   }
   writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf-8');
 
   logger.info(`Applied ${applied.length} fixes`);
   return { applied, failed };
+}
+
+// --- Override strategies per package manager ---
+
+type OverrideStrategy = {
+  name: string;
+  installCmd: string[];
+  getExisting: (pkg: Record<string, unknown>) => Record<string, string>;
+  setOverrides: (pkg: Record<string, unknown>, overrides: Record<string, string>) => void;
+  removeOverrides: (pkg: Record<string, unknown>) => void;
+};
+
+function safeGetRecord(value: unknown): Record<string, string> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, string>)
+    : {};
+}
+
+function getOverrideStrategy(type: LockfileType): OverrideStrategy {
+  if (type.startsWith('yarn')) {
+    return {
+      name: 'yarn resolutions',
+      installCmd: ['yarn', 'install'],
+      getExisting: (pkg) => safeGetRecord(pkg.resolutions),
+      setOverrides: (pkg, overrides) => { pkg.resolutions = overrides; },
+      removeOverrides: (pkg) => { delete pkg.resolutions; },
+    };
+  }
+
+  if (type.startsWith('pnpm')) {
+    return {
+      name: 'pnpm overrides',
+      installCmd: ['pnpm', 'install', '--lockfile-only'],
+      getExisting: (pkg) => {
+        const pnpmConfig = safeGetRecord(pkg.pnpm);
+        return safeGetRecord(pnpmConfig.overrides);
+      },
+      setOverrides: (pkg, overrides) => {
+        const existing = safeGetRecord(pkg.pnpm);
+        pkg.pnpm = { ...existing, overrides };
+      },
+      removeOverrides: (pkg) => {
+        const existing = safeGetRecord(pkg.pnpm);
+        delete existing.overrides;
+        if (Object.keys(existing).length === 0) {
+          delete pkg.pnpm;
+        } else {
+          pkg.pnpm = existing;
+        }
+      },
+    };
+  }
+
+  // Default: npm
+  return {
+    name: 'npm overrides',
+    installCmd: ['npm', 'install', '--package-lock-only'],
+    getExisting: (pkg) => safeGetRecord(pkg.overrides),
+    setOverrides: (pkg, overrides) => { pkg.overrides = overrides; },
+    removeOverrides: (pkg) => { delete pkg.overrides; },
+  };
 }
