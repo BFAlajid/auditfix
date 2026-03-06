@@ -9,10 +9,14 @@ import { loadConfig } from '../core/config.js';
 import { renderTerminalReport, getExitCode } from './output/terminal.js';
 import { renderJsonReport } from './output/json.js';
 import { renderSarifReport } from './output/sarif.js';
+import { generateSbom } from './output/sbom.js';
 import { addToAllowList } from '../core/allowlist/local.js';
 import { planFixes } from '../core/fixer/safe-update.js';
 import { applyFixes } from '../core/fixer/lockfile-writer.js';
+import { generateRemediationPlan } from '../core/fixer/remediation.js';
+import { createFixPr } from '../core/fixer/pr-creator.js';
 import { detectAndParseLockfile } from '../core/lockfile/parser.js';
+import { scanInstallScripts } from '../core/scanner/install-scripts.js';
 import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
 import * as logger from '../utils/logger.js';
@@ -38,6 +42,10 @@ program
   .option('--fix', 'Auto-fix safe (non-breaking) updates', false)
   .option('--json', 'Output as JSON', false)
   .option('--sarif', 'Output as SARIF v2.1.0 JSON (for GitHub Code Scanning)', false)
+  .option('--sbom', 'Generate CycloneDX 1.5 SBOM (JSON)', false)
+  .option('--scan-scripts', 'Scan for suspicious install scripts', false)
+  .option('--remediate', 'Show guided remediation plan', false)
+  .option('--create-pr', 'Create a GitHub PR with fixes (requires gh CLI)', false)
   .option('--verbose', 'Enable debug logging', false)
   .option('--dir <path>', 'Project directory to scan', process.cwd())
   .option('-w, --workspace <name>', 'Filter results to a specific workspace (monorepo)')
@@ -55,6 +63,18 @@ program
     options.dir = dir;
 
     try {
+      // --sbom: generate CycloneDX SBOM and exit (no audit needed)
+      if (options.sbom) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        let projectName: string | undefined;
+        try {
+          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
+          projectName = pkg.name;
+        } catch { /* optional */ }
+        console.log(generateSbom(lockfileResult.graph, VERSION, projectName));
+        process.exit(0);
+      }
+
       // Build CLI overrides from explicitly-set flags only.
       // Only include values the user actually passed on the command line
       // so that config file values are not clobbered by Commander defaults.
@@ -89,10 +109,56 @@ program
         console.log(renderTerminalReport(report, VERSION));
       }
 
+      // Scan install scripts if requested
+      if (options.scanScripts) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        const findings = scanInstallScripts(lockfileResult.graph, options.dir);
+        if (findings.length > 0) {
+          console.log('');
+          console.log(chalk.bold.yellow(`⚠ ${findings.length} suspicious install scripts detected:`));
+          for (const f of findings) {
+            const scope = f.isProduction ? chalk.red('PROD') : chalk.dim('dev');
+            console.log(`  ${scope} ${chalk.bold(f.package)}@${f.version} (${f.scriptName})`);
+            for (const r of f.reasons) {
+              console.log(chalk.dim(`    - ${r}`));
+            }
+          }
+        }
+      }
+
+      // Show guided remediation plan
+      if (options.remediate && report.vulnerabilities.length > 0) {
+        const plan = generateRemediationPlan(report.vulnerabilities);
+        console.log('');
+        console.log(chalk.bold(`Remediation Plan (${plan.fixableVulns}/${plan.totalVulns} fixable):`));
+        for (let i = 0; i < plan.steps.length; i++) {
+          const step = plan.steps[i];
+          const breaking = step.isBreaking ? chalk.red(' BREAKING') : '';
+          const direct = step.isDirect ? chalk.cyan(' direct') : chalk.dim(' transitive');
+          console.log(`  ${i + 1}. ${chalk.bold(step.packageName)} ${step.currentVersion} → ${chalk.green(step.fixVersion)}${direct}${breaking}`);
+          console.log(chalk.dim(`     Fixes: ${step.vulnsFixed.join(', ')} (impact: ${step.impactScore})`));
+        }
+        if (plan.unfixable.length > 0) {
+          console.log(chalk.dim(`\n  No fix available: ${plan.unfixable.join(', ')}`));
+        }
+      }
+
       // Apply fixes if requested
       if (options.fix && report.vulnerabilities.length > 0) {
         console.log('');
-        await runFix(options.dir, report);
+        const fixResult = await runFix(options.dir, report);
+
+        // Create PR if requested and fixes were applied
+        if (options.createPr && fixResult && fixResult.applied.length > 0) {
+          console.log('');
+          console.log(chalk.bold('Creating GitHub PR...'));
+          const prResult = await createFixPr(options.dir, fixResult.applied);
+          if (prResult.success) {
+            console.log(chalk.green(`PR created: ${prResult.prUrl}`));
+          } else {
+            console.log(chalk.red(`PR creation failed: ${prResult.error}`));
+          }
+        }
       }
 
       const exitCode = getExitCode(report);
@@ -138,7 +204,7 @@ program
     console.log(`Added ${advisoryId} (${options.package}) to .auditfixignore — expires ${options.expires}`);
   });
 
-async function runFix(projectDir: string, report: import('../types/report.js').AuditReport): Promise<void> {
+async function runFix(projectDir: string, report: import('../types/report.js').AuditReport): Promise<import('../core/fixer/lockfile-writer.js').FixResult | null> {
   // Read package.json to get declared dependency ranges
   let packageJsonDeps: Record<string, string> = {};
   try {
@@ -150,7 +216,7 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
     };
   } catch {
     logger.warn('Could not read package.json for fix analysis');
-    return;
+    return null;
   }
 
   // Parse lockfile to get dependency graph
@@ -162,7 +228,7 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
     lockfileType = lockfileResult.type;
   } catch {
     logger.warn('Could not parse lockfile for fix analysis');
-    return;
+    return null;
   }
 
   const plan = planFixes(report.vulnerabilities, graph, packageJsonDeps);
@@ -178,7 +244,7 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
     if (plan.noFix.length > 0) {
       console.log(chalk.dim(`${plan.noFix.length} vulnerabilities have no fix available.`));
     }
-    return;
+    return null;
   }
 
   console.log(chalk.bold(`Applying ${plan.safe.length} safe fixes...`));
@@ -206,6 +272,8 @@ async function runFix(projectDir: string, report: import('../types/report.js').A
       console.log(chalk.dim(`  ${b.packageName} ${b.currentVersion} → ${b.fixVersion}: ${b.reason}`));
     }
   }
+
+  return result;
 }
 
 function getDefaultExpiry(): string {

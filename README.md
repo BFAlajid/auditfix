@@ -9,12 +9,17 @@ Smarter npm dependency security CLI. Replaces `npm audit` with production reacha
 
 `npm audit` is noisy. It flags every advisory regardless of whether the vulnerable package is even reachable in production. auditfix solves this by:
 
-- **Production reachability** - Only flags vulnerabilities in packages your production code actually uses
-- **Risk scoring** - Composite score (0-100) based on CVSS, production exposure, exploit availability, and fix availability
-- **Safe auto-fix** - Automatically applies non-breaking updates via lockfile overrides
-- **Multi-lockfile support** - npm, yarn (classic + berry), and pnpm
-- **Multiple output formats** - Terminal, JSON, and SARIF (for GitHub Code Scanning)
-- **Allow-list** - Suppress known false positives with expiry dates and audit trails
+- **Production reachability** — Only flags vulnerabilities in packages your production code actually uses
+- **Risk scoring** — Composite score (0-100) based on CVSS, production exposure, exploit availability, and fix availability
+- **Safe auto-fix** — Automatically applies non-breaking updates via lockfile overrides (npm, yarn, pnpm)
+- **Multi-lockfile support** — npm, yarn (classic + berry), and pnpm
+- **Monorepo support** — Workspace detection with per-workspace vulnerability mapping
+- **CycloneDX SBOM** — Generate a CycloneDX 1.5 Software Bill of Materials
+- **Install script scanner** — Detect suspicious `postinstall`/`preinstall` scripts
+- **Guided remediation** — Holistic fix plans ranked by impact
+- **GitHub PR creation** — Automatically create PRs with security fixes
+- **Multiple output formats** — Terminal, JSON, and SARIF (for GitHub Code Scanning)
+- **Allow-list** — Suppress known false positives with expiry dates and audit trails
 
 ## Install
 
@@ -42,6 +47,21 @@ auditfix --severity high
 
 # Auto-fix safe updates
 auditfix --fix
+
+# Auto-fix and create a GitHub PR
+auditfix --fix --create-pr
+
+# Show guided remediation plan
+auditfix --remediate
+
+# Generate CycloneDX SBOM
+auditfix --sbom > sbom.json
+
+# Scan for suspicious install scripts
+auditfix --scan-scripts
+
+# Filter to a specific workspace (monorepo)
+auditfix --workspace @myorg/api
 
 # JSON output for scripting
 auditfix --json
@@ -87,6 +107,16 @@ SARIF v2.1.0 output for GitHub Code Scanning integration:
 auditfix --sarif > results.sarif
 ```
 
+### CycloneDX SBOM (`--sbom`)
+
+Generate a CycloneDX 1.5 Software Bill of Materials:
+
+```bash
+auditfix --sbom > sbom.json
+```
+
+### GitHub Actions Workflow
+
 Full GitHub Actions workflow (copy to `.github/workflows/auditfix.yml`):
 
 ```yaml
@@ -131,7 +161,7 @@ jobs:
 
 ## Configuration
 
-Create `.auditfixrc.json` in your project root:
+Create `.auditfixrc.json` or `.auditfixrc.yaml` in your project root:
 
 ```json
 {
@@ -141,19 +171,20 @@ Create `.auditfixrc.json` in your project root:
 }
 ```
 
-Supports: `.auditfixrc.json`, `.auditfixrc.yaml`, `.auditfixrc.yml`, `auditfix.config.js`, `auditfix.config.cjs`.
+Supports: `.auditfixrc`, `.auditfixrc.json`, `.auditfixrc.yml`, `.auditfixrc.yaml`, and `package.json` (`auditfix` key).
 
 CLI flags override config file values.
 
 ## How It Works
 
-1. **Parse lockfile** - Reads `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`
-2. **Build dependency graph** - Maps all packages with production/dev classification
-3. **Fetch advisories** - Three-tier fallback: OSV.dev API, local cache (4hr TTL, HMAC-verified), npm bulk endpoint
-4. **Match vulnerabilities** - Checks installed versions against advisory semver ranges
-5. **Score risks** - Composite scoring: CVSS base (40%), production reachability (30%), exploit status (15%), fix availability (10%), dependency depth (5%)
-6. **Apply allow-list** - Filters out suppressed advisories with alias matching (GHSA/CVE cross-reference)
-7. **Auto-fix** (with `--fix`) - Applies safe updates within declared semver ranges via npm overrides
+1. **Parse lockfile** — Reads `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`
+2. **Build dependency graph** — Maps all packages with production/dev classification
+3. **Detect workspaces** — npm/yarn workspaces and pnpm-workspace.yaml
+4. **Fetch advisories** — Three-tier fallback: OSV.dev API, local cache (4hr TTL, HMAC-verified), npm bulk endpoint
+5. **Match vulnerabilities** — Checks installed versions against advisory semver ranges
+6. **Score risks** — Composite scoring: CVSS base (40%), production reachability (30%), exploit status (15%), fix availability (10%), dependency depth (5%)
+7. **Apply allow-list** — Filters out suppressed advisories with alias matching (GHSA/CVE cross-reference)
+8. **Auto-fix** (with `--fix`) — Applies safe updates via npm overrides, yarn resolutions, or pnpm.overrides
 
 ## Supported Lockfiles
 
@@ -166,17 +197,20 @@ CLI flags override config file values.
 
 ## Security
 
-- **No shell injection** - All child processes use `execFile` with argument arrays, never string interpolation
-- **Prototype pollution prevention** - JSON parsing uses a reviver that strips `__proto__`, `constructor`, `prototype`
-- **Cache integrity** - HMAC-SHA256 verification on all cached advisory data
-- **Token redaction** - GitHub tokens (`ghp_`, `ghs_`, `github_pat_`) are never logged
-- **Path traversal prevention** - Lockfile paths and cache keys are validated against traversal attacks
-- **Safe YAML parsing** - Uses js-yaml v4+ (no `!!js/function` RCE)
+- **No shell injection** — All child processes use `execFile` with argument arrays
+- **Prototype pollution prevention** — JSON parsing uses a reviver that strips `__proto__`, `constructor`, `prototype`
+- **Cache integrity** — HMAC-SHA256 verification on all cached advisory data
+- **Token redaction** — GitHub, npm, GitLab, and AWS tokens are never logged
+- **Path traversal prevention** — Lockfile paths and cache keys are validated against traversal attacks
+- **Symlink rejection** — Cache writes and lockfile writes reject symlink targets
+- **Safe YAML parsing** — Uses js-yaml v4+ DEFAULT_SCHEMA (no `!!js/function` RCE)
+- **Config safety** — Only JSON/YAML config files are loaded (no JS execution via config)
 
 ## Requirements
 
 - Node.js >= 18
 - A lockfile (`package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml`)
+- `gh` CLI for `--create-pr` (optional)
 
 ## License
 
