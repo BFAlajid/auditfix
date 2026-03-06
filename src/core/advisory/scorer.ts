@@ -5,20 +5,28 @@
 import type { AdvisoryMatch } from '../../types/advisory.js';
 import type { RiskScore, ScoredVulnerability } from '../../types/report.js';
 import { parseCvssVector, cvssToSeverity } from './cvss.js';
+import type { EpssScore } from './epss.js';
+import { extractCveIds, computeExploitScore } from './epss.js';
+
+export type ScorerContext = {
+  epssScores?: Map<string, EpssScore>;
+  kevSet?: Set<string>;
+};
 
 /**
  * Score a single advisory match.
  */
-export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
+export function scoreMatch(match: AdvisoryMatch, ctx: ScorerContext = {}): ScoredVulnerability {
   const { advisory } = match;
 
   // Parse CVSS vector from severity data
   let cvssScore = 0;
   let cvssVector = '';
   if (advisory.severity && advisory.severity.length > 0) {
-    // Prefer CVSS_V3
+    // Prefer CVSS_V3, then V4, then V2
     const v3 = advisory.severity.find((s) => s.type === 'CVSS_V3');
-    const severity = v3 ?? advisory.severity[0];
+    const v4 = advisory.severity.find((s) => s.type === 'CVSS_V4');
+    const severity = v3 ?? v4 ?? advisory.severity[0];
     const parsed = parseCvssVector(severity.score);
     cvssScore = parsed.score;
     cvssVector = parsed.vector;
@@ -28,15 +36,24 @@ export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
   const directDependency = match.dependencyPath.length <= 1;
   const depth = match.dependencyPath.length;
 
-  // Check for known exploit references
-  const exploitAvailable = hasExploitIndicator(advisory.references?.map(r => r.url) ?? []);
+  // Compute exploit score from EPSS + KEV data (graduated scoring)
+  const cveIds = extractCveIds(advisory.aliases ?? []);
+  const exploitResult = computeExploitScore(
+    cveIds,
+    ctx.epssScores ?? new Map(),
+    ctx.kevSet ?? new Set(),
+  );
+
+  // Fall back to URL-based detection if no EPSS/KEV data
+  const urlExploit = hasExploitIndicator(advisory.references?.map(r => r.url) ?? []);
+  const exploitAvailable = exploitResult.inKev || exploitResult.score > 0 || urlExploit;
 
   // Compute composite score (0-100)
   const score = computeCompositeScore({
     cvssScore,
     isProduction: match.isProduction,
     isDirectlyImported: match.isDirectlyImported ?? false,
-    exploitAvailable,
+    exploitScore: exploitResult.score > 0 ? exploitResult.score : (urlExploit ? 15 : 0),
     fixAvailable,
     depth,
     directDependency,
@@ -58,6 +75,8 @@ export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
       productionReachable: match.isProduction,
       directlyImported: match.isDirectlyImported ?? false,
       exploitAvailable,
+      epssScore: exploitResult.epssMax,
+      inKev: exploitResult.inKev,
       fixAvailable,
       fixVersion: advisory.fixVersion,
       depth,
@@ -71,9 +90,9 @@ export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
 /**
  * Score all matches and sort by risk (highest first).
  */
-export function scoreAllMatches(matches: AdvisoryMatch[]): ScoredVulnerability[] {
+export function scoreAllMatches(matches: AdvisoryMatch[], ctx: ScorerContext = {}): ScoredVulnerability[] {
   return matches
-    .map(scoreMatch)
+    .map(m => scoreMatch(m, ctx))
     .sort((a, b) => b.risk.score - a.risk.score);
 }
 
@@ -81,7 +100,7 @@ function computeCompositeScore(factors: {
   cvssScore: number;
   isProduction: boolean;
   isDirectlyImported: boolean;
-  exploitAvailable: boolean;
+  exploitScore: number;
   fixAvailable: boolean;
   depth: number;
   directDependency: boolean;
@@ -101,10 +120,8 @@ function computeCompositeScore(factors: {
     score += 10;
   }
 
-  // Exploit available: significant boost
-  if (factors.exploitAvailable) {
-    score += 15;
-  }
+  // Exploit score: graduated 0-20 from EPSS/KEV (replaces old binary 15)
+  score += factors.exploitScore;
 
   // No fix available: slight boost (harder to remediate)
   if (!factors.fixAvailable) {

@@ -9,6 +9,8 @@ export type RiskScore = {
     productionReachable: boolean;
     directlyImported: boolean;
     exploitAvailable: boolean;
+    epssScore: number | null;
+    inKev: boolean;
     fixAvailable: boolean;
     fixVersion: string | null;
     depth: number;

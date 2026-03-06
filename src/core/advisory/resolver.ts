@@ -87,7 +87,7 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
 
   // Tier 3: Bundled offline index
   logger.info('Checking bundled offline advisory index...');
-  const offlineAdvisories = queryOfflineIndexBatch(graph);
+  const offlineAdvisories = await queryOfflineIndexBatch(graph);
   if (offlineAdvisories.size > 0) {
     logger.info(`Using ${offlineAdvisories.size} entries from offline index`);
     return {

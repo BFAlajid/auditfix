@@ -14,7 +14,7 @@ function makeVuln(pkg: string, id: string, fixVersion: string | null, label: str
     risk: {
       score: 80,
       label: label as 'critical' | 'high' | 'medium' | 'low',
-      factors: { cvssScore: 8, cvssVector: '', productionReachable: true, exploitAvailable: false, fixAvailable: !!fixVersion, fixVersion, depth: 1, directDependency: true },
+      factors: { cvssScore: 8, cvssVector: '', productionReachable: true, directlyImported: false, exploitAvailable: false, epssScore: null, inKev: false, fixAvailable: !!fixVersion, fixVersion, depth: 1, directDependency: true },
     },
   };
 }

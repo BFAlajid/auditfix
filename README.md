@@ -5,35 +5,35 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 
-Smarter npm dependency security CLI. Replaces `npm audit` with production reachability analysis, risk scoring, and safe auto-fixes.
+Smarter npm dependency security CLI. Replaces `npm audit` with production reachability analysis, risk scoring, supply chain intelligence, and safe auto-fixes.
 
 ## Example Output
 
 ```
-auditfix v1.4.0 — scanned 847 packages
+auditfix v2.0.0 — scanned 847 packages
 
 CRITICAL (1)
   lodash@4.17.20 — Prototype Pollution in lodash
   Path: my-app > lodash
-  Production: YES | Exploit: NO | Fix: 4.17.21
+  Production: YES | EPSS: 0.87 (18/20) | CISA KEV: NO | Fix: 4.17.21
   → Run `auditfix --fix` to auto-patch
 
 HIGH (2)
   express@4.17.1 — Open redirect in express
   Path: my-app > express
-  Production: YES | Exploit: NO | Fix: 4.19.2
+  Production: YES | EPSS: 0.34 (7/20) | CISA KEV: NO | Fix: 4.19.2
   → Run `auditfix --fix` to auto-patch
 
   jsonwebtoken@8.5.1 — Insecure default algorithm in jsonwebtoken
   Path: my-app > jsonwebtoken
-  Production: YES | Exploit: NO | Fix: 9.0.0
+  Production: YES | EPSS: 0.52 (10/20) | CISA KEV: NO | Fix: 9.0.0
   → Run `auditfix --fix` to auto-patch
 
 MEDIUM (0)
 LOW (1)
   semver@5.7.1 — ReDoS in semver
   Path: my-app > semver
-  Production: NO (dev only) | Exploit: NO | Fix: 7.5.2
+  Production: NO (dev only) | EPSS: 0.02 (0/20) | CISA KEV: NO | Fix: 7.5.2
   → Low risk. Dev tooling only.
 
 Scanned: 847 packages
@@ -50,7 +50,10 @@ CI exit code: 1 (production vulnerabilities found)
 
 - **Production reachability** — Only flags vulnerabilities in packages your production code actually uses
 - **Import chain analysis** — Static analysis of import/require statements to verify packages are actually imported
-- **Risk scoring** — Composite score (0-100) based on CVSS, production exposure, exploit availability, and fix availability
+- **Risk scoring** — Composite score (0-100) based on CVSS (v3.1 + v4.0), production exposure, EPSS exploit probability, CISA KEV status, and fix availability
+- **EPSS + CISA KEV scoring** — Graduated exploit scoring (0-20 points) using real-time EPSS probabilities and the CISA Known Exploited Vulnerabilities catalog
+- **Supply chain protection** — Typosquatting detection, provenance verification, and behavioral analysis of package source code
+- **VEX generation** — OpenVEX v0.2.0 documents mapping reachability analysis to machine-readable vulnerability statuses
 - **Safe auto-fix** — Automatically applies non-breaking updates via lockfile overrides (npm, yarn, pnpm)
 - **Scan diff** — Compare two scans to detect regressions (`auditfix diff baseline.json current.json`)
 - **Multi-lockfile support** — npm, yarn (classic + berry), and pnpm
@@ -128,6 +131,18 @@ auditfix --sbom > sbom.json
 
 # Scan for suspicious install scripts
 auditfix --scan-scripts
+
+# Check for typosquatted packages
+auditfix --check-typosquats
+
+# Verify package provenance (Sigstore attestation)
+auditfix --check-provenance
+
+# Deep behavioral analysis of package source
+auditfix --scan-behavior
+
+# Generate OpenVEX document
+auditfix --vex > audit.vex.json
 
 # Filter to a specific workspace (monorepo)
 auditfix --workspace @myorg/api
@@ -211,6 +226,86 @@ auditfix --check-deps-age
 ```
 
 Queries the npm registry for last publish dates. Helps identify abandoned or unmaintained dependencies.
+
+## Supply Chain Intelligence
+
+v2.0.0 adds deep supply chain analysis beyond vulnerability scanning.
+
+### EPSS + CISA KEV Scoring
+
+Exploit scoring now uses a graduated 0-20 point scale instead of a binary yes/no:
+
+- **EPSS** (Exploit Prediction Scoring System) — Real-time exploit probability from the FIRST.org API. Higher EPSS percentiles contribute more points.
+- **CISA KEV** — Cross-references the CISA Known Exploited Vulnerabilities catalog. Packages listed in KEV receive maximum exploit points.
+
+EPSS and KEV data are fetched automatically during scans and cached alongside advisories.
+
+### Typosquatting Detection
+
+```bash
+auditfix --check-typosquats
+```
+
+Compares every installed package name against the top 100 npm packages using:
+
+- Levenshtein distance (edit distance <= 2)
+- Common character substitution patterns (`0` for `o`, `1` for `l`, `rn` for `m`)
+- Scope-stripping detection (e.g., `express` mimicking `@expressjs/express`)
+
+Flags suspicious matches with the likely impersonation target.
+
+### Provenance Verification
+
+```bash
+auditfix --check-provenance
+```
+
+Checks npm registry Sigstore attestation endpoints for each installed package. Reports:
+
+- Total verified vs. unverified package count
+- Production packages without provenance attestation (flagged as higher risk)
+
+Useful for enforcing build provenance policies in CI.
+
+### Behavioral Analysis
+
+```bash
+auditfix --scan-behavior
+```
+
+Deep-scans package source code for risky patterns across 14 categories:
+
+| Category | Examples |
+|----------|----------|
+| Code execution | `eval()`, `new Function()`, `vm.runInNewContext()` |
+| Process spawning | `child_process.exec()`, `execSync()` |
+| Network access | `http.request()`, `fetch()`, `net.connect()` |
+| Environment access | `process.env` harvesting |
+| Filesystem access | Writes outside package directory |
+| DNS lookups | `dns.resolve()`, `dns.lookup()` |
+| Obfuscation | Hex-encoded strings, base64 decoding chains |
+
+Each finding includes a risk level. Combine with `--scan-scripts` for full install-time and runtime coverage.
+
+### VEX Generation
+
+```bash
+auditfix --vex > audit.vex.json
+```
+
+Generates an [OpenVEX](https://openvex.dev/) v0.2.0 document that maps auditfix reachability analysis to standardized VEX statuses:
+
+| Reachability | VEX Status |
+|-------------|-----------|
+| Dev-only dependency | `not_affected` (justification: `component_not_present`) |
+| Production but not imported | `under_investigation` |
+| Production and imported | `affected` |
+
+VEX documents can be attached to SBOMs to communicate vulnerability triage decisions to downstream consumers.
+
+### CVSS v4.0 Support
+
+auditfix now parses CVSS v4.0 vectors from OSV advisories in addition to CVSS v3.1. When both are present, the v4.0 score is preferred for risk calculation.
 
 ## Watch Mode
 
@@ -322,7 +417,7 @@ Automatically create PRs with security fixes on a schedule. See [`examples/auto-
 auditfix ships as a reusable GitHub Action:
 
 ```yaml
-- uses: BFAlajid/auditfix@v1
+- uses: BFAlajid/auditfix@v2
   with:
     severity: high
     production-only: true
@@ -363,7 +458,7 @@ CLI flags override config file values.
 4. **Scan import chains** — Static analysis of import/require to determine reachability
 5. **Fetch advisories** — Four-tier fallback: OSV.dev API, local cache (4hr TTL, HMAC-verified), bundled offline index, npm bulk endpoint
 6. **Match vulnerabilities** — Checks installed versions against advisory semver ranges
-7. **Score risks** — Composite scoring: CVSS base (40%), production reachability (30%), import chain (+10%), exploit status (15%), fix availability (10%), dependency depth (5%)
+7. **Score risks** — Composite scoring: CVSS base v3.1/v4.0 (40%), production reachability (30%), import chain (+10%), EPSS + CISA KEV exploit score (15%), fix availability (10%), dependency depth (5%)
 8. **Apply allow-list** — Filters out suppressed advisories with alias matching (GHSA/CVE cross-reference)
 9. **Auto-fix** (with `--fix`) — Applies safe updates via npm overrides, yarn resolutions, or pnpm.overrides
 

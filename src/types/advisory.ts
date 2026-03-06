@@ -19,7 +19,7 @@ export type OsvAffected = {
 };
 
 export type OsvSeverity = {
-  type: 'CVSS_V3' | 'CVSS_V2';
+  type: 'CVSS_V3' | 'CVSS_V2' | 'CVSS_V4';
   score: string; // CVSS vector string
 };
 

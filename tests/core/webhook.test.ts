@@ -19,7 +19,7 @@ function makeReport(vulnCount: number = 0): AuditReport {
         dependencyPath: [`pkg-${i}`],
         isProduction: true,
       },
-      risk: { score: 70, label: 'high' as const, factors: { cvssScore: 7.5, cvssVector: '', productionReachable: true, directlyImported: false, exploitAvailable: false, fixAvailable: true, fixVersion: '2.0.0', depth: 1, directDependency: true } },
+      risk: { score: 70, label: 'high' as const, factors: { cvssScore: 7.5, cvssVector: '', productionReachable: true, directlyImported: false, exploitAvailable: false, epssScore: null, inKev: false, fixAvailable: true, fixVersion: '2.0.0', depth: 1, directDependency: true } },
     })),
     metadata: {
       totalPackages: 50,

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx vitest:*)",
+      "Bash(npx tsup:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node:*)",
+      "Bash(npm link:*)",
+      "Bash(auditfix:*)",
+      "Bash(npm config:*)",
+      "Read(//c/Users/User/AppData/Roaming/npm/**)",
+      "Bash(npm:*)",
+      "Bash(\"C:/Users/User/AppData/Roaming/npm/auditfix.cmd\":*)",
+      "Bash(\"C:/Users/User/AppData/Roaming/npm/auditfix.cmd\" ignore:*)",
+      "Bash(gh auth:*)",
+      "Bash(gh repo:*)",
+      "Bash(mkdir:*)",
+      "Bash(gh run:*)",
+      "Bash(npx eslint:*)"
+    ]
+  }
+}

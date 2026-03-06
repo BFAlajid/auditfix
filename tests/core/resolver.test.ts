@@ -15,7 +15,7 @@ vi.mock('../../src/core/advisory/cache.js', () => ({
 }));
 
 vi.mock('../../src/core/advisory/offline-index.js', () => ({
-  queryOfflineIndexBatch: vi.fn().mockReturnValue(new Map()),
+  queryOfflineIndexBatch: vi.fn().mockResolvedValue(new Map()),
 }));
 
 vi.mock('../../src/utils/logger.js', () => ({

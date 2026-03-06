@@ -20,6 +20,10 @@ import { scanInstallScripts } from '../core/scanner/install-scripts.js';
 import { scanLicenses } from '../core/scanner/license-checker.js';
 import { sendWebhook } from '../core/notify/webhook.js';
 import { checkDepAge } from '../core/scanner/dep-age.js';
+import { detectTyposquats } from '../core/scanner/typosquat.js';
+import { checkProvenance } from '../core/scanner/provenance.js';
+import { scanBehavior } from '../core/scanner/behavior.js';
+import { generateVex } from './output/vex.js';
 import { diffReports } from '../core/diff.js';
 import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
@@ -30,7 +34,7 @@ import { join } from 'node:path';
 import { safeJsonParse } from '../utils/sanitize.js';
 import chalk from 'chalk';
 
-const VERSION = process.env.AUDITFIX_VERSION ?? '1.0.1';
+const VERSION = process.env.AUDITFIX_VERSION ?? '2.0.0';
 
 const SEVERITY_CHOICES = ['critical', 'high', 'medium', 'low', 'info'];
 
@@ -54,6 +58,10 @@ program
   .addOption(new Option('--fail-on <strategy>', 'CI exit code strategy').choices(['production-critical', 'production-high', 'any']))
   .option('--check-licenses', 'Scan dependencies for copyleft/problematic licenses', false)
   .option('--check-deps-age', 'Flag packages with no updates in 2+ years', false)
+  .option('--check-typosquats', 'Detect potential typosquatting packages', false)
+  .option('--check-provenance', 'Check npm package provenance attestations', false)
+  .option('--scan-behavior', 'Deep scan package source for suspicious behavior patterns', false)
+  .option('--vex', 'Generate OpenVEX document from scan results', false)
   .option('--webhook <url>', 'Send results to a webhook URL (Slack or generic)')
   .option('--watch', 'Watch lockfile for changes and re-scan', false)
   .option('--verbose', 'Enable debug logging', false)
@@ -215,6 +223,78 @@ program
         } else {
           console.log(chalk.green('All dependencies are actively maintained.'));
         }
+      }
+
+      // Check typosquats if requested
+      if (options.checkTyposquats) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        const typosquatFindings = detectTyposquats(lockfileResult.graph);
+        if (typosquatFindings.length > 0) {
+          console.log('');
+          console.log(chalk.bold.red(`⚠ ${typosquatFindings.length} potential typosquat packages detected:`));
+          for (const f of typosquatFindings) {
+            const scope = f.isProduction ? chalk.red('PROD') : chalk.dim('dev');
+            console.log(`  ${scope} ${chalk.bold(f.package)}@${f.version} → similar to ${chalk.cyan(f.similarTo)}`);
+            console.log(chalk.dim(`    ${f.reason}`));
+          }
+        } else {
+          console.log(chalk.green('\nNo typosquatting concerns detected.'));
+        }
+      }
+
+      // Check provenance if requested
+      if (options.checkProvenance) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        console.log('');
+        console.log(chalk.bold('Checking package provenance attestations...'));
+        const provReport = await checkProvenance(lockfileResult.graph);
+        console.log(`  Verified: ${chalk.green(String(provReport.verified))} | Unverified: ${chalk.yellow(String(provReport.unverified))}`);
+        const unverifiedProd = provReport.findings.filter(f => !f.hasProvenance && f.isProduction);
+        if (unverifiedProd.length > 0) {
+          console.log(chalk.yellow(`  ${unverifiedProd.length} production packages lack provenance:`));
+          for (const f of unverifiedProd.slice(0, 20)) {
+            console.log(chalk.dim(`    ${f.package}@${f.version}`));
+          }
+          if (unverifiedProd.length > 20) {
+            console.log(chalk.dim(`    ... and ${unverifiedProd.length - 20} more`));
+          }
+        }
+      }
+
+      // Scan behavior if requested
+      if (options.scanBehavior) {
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        console.log('');
+        console.log(chalk.bold('Scanning package source for suspicious behavior...'));
+        const behaviorFindings = scanBehavior(lockfileResult.graph, options.dir);
+        if (behaviorFindings.length > 0) {
+          const critCount = behaviorFindings.filter(f => f.riskLevel === 'critical').length;
+          const highCount = behaviorFindings.filter(f => f.riskLevel === 'high').length;
+          console.log(chalk.bold.yellow(`  ${behaviorFindings.length} packages with suspicious patterns (${critCount} critical, ${highCount} high):`));
+          for (const f of behaviorFindings.slice(0, 30)) {
+            const scope = f.isProduction ? chalk.red('PROD') : chalk.dim('dev');
+            const risk = f.riskLevel === 'critical' ? chalk.red(f.riskLevel) :
+                         f.riskLevel === 'high' ? chalk.yellow(f.riskLevel) : chalk.dim(f.riskLevel);
+            console.log(`  ${scope} ${chalk.bold(f.package)}@${f.version} ${f.file} [${risk}]`);
+            for (const b of f.behaviors.slice(0, 3)) {
+              console.log(chalk.dim(`    L${b.line ?? '?'}: ${b.description}`));
+            }
+          }
+        } else {
+          console.log(chalk.green('No suspicious behavior patterns detected.'));
+        }
+      }
+
+      // Generate VEX document if requested
+      if (options.vex) {
+        let projectName: string | undefined;
+        try {
+          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
+          projectName = pkg.name;
+        } catch { /* optional */ }
+        const vexDoc = generateVex(report, VERSION, projectName);
+        console.log('');
+        console.log(vexDoc);
       }
 
       // Send webhook notification if URL provided

@@ -6,7 +6,7 @@
  * The index is intentionally small — only critical/high severity advisories
  * for the top 200 npm packages. It's a last-resort fallback, not a primary source.
  *
- * Update: run `npx auditfix --update-index` to refresh from OSV.
+ * Update: run `npm run build:index` to regenerate from OSV bulk export.
  */
 import type { Advisory } from '../../types/advisory.js';
 import semver from 'semver';
@@ -21,10 +21,32 @@ export type OfflineEntry = {
 };
 
 /**
- * Built-in advisory index — last updated at build time.
+ * Try to load the auto-generated index from the OSV bulk export.
+ * Falls back to the hardcoded index if the generated file does not exist.
+ */
+let generatedIndex: OfflineEntry[] | null = null;
+let generatedLoaded = false;
+
+async function loadGeneratedIndex(): Promise<OfflineEntry[] | null> {
+  if (generatedLoaded) return generatedIndex;
+  generatedLoaded = true;
+  try {
+    // @ts-expect-error — generated file may not exist; handled by catch
+    const mod = await import('./offline-index.generated.js');
+    if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
+      generatedIndex = mod.GENERATED_INDEX;
+    }
+  } catch {
+    // Generated file does not exist — fall back to built-in index
+  }
+  return generatedIndex;
+}
+
+/**
+ * Built-in advisory index — hardcoded last-resort fallback.
  * This is a curated subset of high-impact advisories.
  */
-const BUILTIN_INDEX: OfflineEntry[] = [
+const HARDCODED_INDEX: OfflineEntry[] = [
   { id: 'GHSA-35jh-r3h4-6jhm', pkg: 'lodash', range: '<4.17.21', fix: '4.17.21', severity: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', summary: 'Prototype Pollution in lodash' },
   { id: 'GHSA-jf85-cpcp-j695', pkg: 'lodash', range: '<4.17.12', fix: '4.17.12', severity: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N', summary: 'Prototype Pollution in lodash' },
   { id: 'GHSA-4xc9-xhrj-v574', pkg: 'minimist', range: '<1.2.6', fix: '1.2.6', severity: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L', summary: 'Prototype Pollution in minimist' },
@@ -46,6 +68,34 @@ const BUILTIN_INDEX: OfflineEntry[] = [
   { id: 'GHSA-8225-6cvr-8pqp', pkg: 'node-forge', range: '<1.3.0', fix: '1.3.0', severity: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N', summary: 'URL parsing vulnerability in node-forge' },
   { id: 'GHSA-2fc9-xpp8-2g9h', pkg: 'postcss', range: '<8.4.31', fix: '8.4.31', severity: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L', summary: 'Line return parsing issue in postcss' },
 ];
+
+/**
+ * The effective index: generated (if available) merged with hardcoded fallback.
+ * Generated index takes precedence; hardcoded entries are appended only if
+ * their id+pkg combination is not already present in the generated set.
+ */
+function buildEffectiveIndex(gen: OfflineEntry[] | null): OfflineEntry[] {
+  if (gen === null) {
+    return HARDCODED_INDEX;
+  }
+  const seen = new Set(gen.map((e) => `${e.id}:${e.pkg}`));
+  const extras = HARDCODED_INDEX.filter((e) => !seen.has(`${e.id}:${e.pkg}`));
+  return [...gen, ...extras];
+}
+
+// Synchronous fallback used immediately; enriched lazily
+let BUILTIN_INDEX: OfflineEntry[] = HARDCODED_INDEX;
+
+// Attempt to load generated index on first async call
+let indexReady: Promise<void> | null = null;
+function ensureIndex(): Promise<void> {
+  if (!indexReady) {
+    indexReady = loadGeneratedIndex().then((gen) => {
+      BUILTIN_INDEX = buildEffectiveIndex(gen);
+    });
+  }
+  return indexReady;
+}
 
 /**
  * Query the offline index for advisories affecting a specific package + version.
@@ -87,9 +137,10 @@ export function queryOfflineIndex(
  * Query the offline index for all packages in a dependency graph.
  * Returns advisories keyed by package name.
  */
-export function queryOfflineIndexBatch(
+export async function queryOfflineIndexBatch(
   graph: import('../../types/package.js').DependencyGraph,
-): Map<string, Advisory[]> {
+): Promise<Map<string, Advisory[]>> {
+  await ensureIndex();
   const result = new Map<string, Advisory[]>();
   const checked = new Set<string>();
 

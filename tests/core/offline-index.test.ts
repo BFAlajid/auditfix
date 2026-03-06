@@ -28,13 +28,13 @@ describe('Offline advisory index', () => {
     expect(results).toHaveLength(0);
   });
 
-  it('batch queries all packages in a graph', () => {
+  it('batch queries all packages in a graph', async () => {
     const graph: DependencyGraph = new Map();
     graph.set('lodash@4.17.20', makeNode('lodash', '4.17.20'));
     graph.set('express@4.18.0', makeNode('express', '4.18.0'));
     graph.set('safe-pkg@1.0.0', makeNode('safe-pkg', '1.0.0'));
 
-    const result = queryOfflineIndexBatch(graph);
+    const result = await queryOfflineIndexBatch(graph);
     expect(result.has('lodash')).toBe(true);
     expect(result.has('express')).toBe(true);
     expect(result.has('safe-pkg')).toBe(false);

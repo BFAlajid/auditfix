@@ -8,6 +8,8 @@ import { computeDependencyPaths } from './graph/reachability.js';
 import { resolveAdvisories, AdvisoryResolutionError } from './advisory/resolver.js';
 import { matchAdvisories } from './advisory/matcher.js';
 import { scoreAllMatches } from './advisory/scorer.js';
+import type { ScorerContext } from './advisory/scorer.js';
+import { fetchEpssScores, fetchKevCatalog, extractCveIds } from './advisory/epss.js';
 import { loadLocalAllowList, applyAllowList } from './allowlist/local.js';
 import { detectWorkspaces, mapDepsToWorkspaces } from './workspace/detector.js';
 import { scanImportChains, isDirectlyImported } from './graph/import-chain.js';
@@ -120,8 +122,27 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     logger.info(`${ignored.length} vulnerabilities suppressed by allow-list`);
   }
 
-  // 7. Score and sort
-  let scored = scoreAllMatches(matches);
+  // 7. Fetch EPSS + KEV data for exploit scoring
+  const allCveIds = new Set<string>();
+  for (const m of matches) {
+    for (const cve of extractCveIds(m.advisory.aliases ?? [])) {
+      allCveIds.add(cve);
+    }
+  }
+
+  let scorerCtx: ScorerContext = {};
+  if (allCveIds.size > 0) {
+    logger.info(`Fetching EPSS/KEV data for ${allCveIds.size} CVEs...`);
+    const [epssScores, kevSet] = await Promise.all([
+      fetchEpssScores([...allCveIds]).catch(() => new Map()),
+      fetchKevCatalog().catch(() => new Set<string>()),
+    ]);
+    scorerCtx = { epssScores, kevSet };
+    logger.debug(`EPSS: ${epssScores.size} scores, KEV: ${kevSet.size} entries`);
+  }
+
+  // 8. Score and sort
+  let scored = scoreAllMatches(matches, scorerCtx);
 
   // Filter by workspace if requested
   if (options.workspace) {

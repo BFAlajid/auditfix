@@ -15,7 +15,7 @@ function makeReport(
         dependencyPath: [`pkg-${i}`],
         isProduction: v.production,
       },
-      risk: { score: 70, label: v.severity as 'critical' | 'high' | 'medium' | 'low', factors: { cvssScore: 7.0, cvssVector: '', productionReachable: v.production, directlyImported: false, exploitAvailable: false, fixAvailable: true, fixVersion: '2.0.0', depth: 1, directDependency: true } },
+      risk: { score: 70, label: v.severity as 'critical' | 'high' | 'medium' | 'low', factors: { cvssScore: 7.0, cvssVector: '', productionReachable: v.production, directlyImported: false, exploitAvailable: false, epssScore: null, inKev: false, fixAvailable: true, fixVersion: '2.0.0', depth: 1, directDependency: true } },
     })),
     metadata: {
       totalPackages: 50,
