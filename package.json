@@ -1,14 +1,14 @@
 {
   "name": "auditfix",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Smarter npm dependency security CLI — production reachability, actionable fixes, noise-free reports",
   "type": "module",
   "bin": {
-    "auditfix": "./dist/index.js"
+    "auditfix": "dist/index.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/BFAlajid/auditfix.git"
+    "url": "git+https://github.com/BFAlajid/auditfix.git"
   },
   "homepage": "https://github.com/BFAlajid/auditfix",
   "scripts": {

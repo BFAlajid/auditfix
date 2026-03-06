@@ -20,7 +20,7 @@ import { join } from 'node:path';
 import { safeJsonParse } from '../utils/sanitize.js';
 import chalk from 'chalk';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 
 const program = new Command();
 
