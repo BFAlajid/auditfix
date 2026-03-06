@@ -17,6 +17,7 @@ import {
   cacheAdvisoryBatch,
   getCachedPackageAdvisories,
 } from './cache.js';
+import { queryOfflineIndexBatch } from './offline-index.js';
 import * as logger from '../../utils/logger.js';
 
 export type ResolverResult = {
@@ -84,8 +85,21 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
     };
   }
 
-  // Tier 3: npm bulk advisory endpoint
-  logger.info('Cache empty, trying npm bulk advisory endpoint...');
+  // Tier 3: Bundled offline index
+  logger.info('Checking bundled offline advisory index...');
+  const offlineAdvisories = queryOfflineIndexBatch(graph);
+  if (offlineAdvisories.size > 0) {
+    logger.info(`Using ${offlineAdvisories.size} entries from offline index`);
+    return {
+      advisories: offlineAdvisories,
+      source: 'Bundled offline index',
+      confidence: 'LOW',
+      errors,
+    };
+  }
+
+  // Tier 4: npm bulk advisory endpoint
+  logger.info('Offline index empty, trying npm bulk advisory endpoint...');
   try {
     const npmResult = await fetchNpmAdvisories(graph);
 

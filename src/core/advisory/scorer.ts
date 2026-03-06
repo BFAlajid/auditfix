@@ -35,6 +35,7 @@ export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
   const score = computeCompositeScore({
     cvssScore,
     isProduction: match.isProduction,
+    isDirectlyImported: match.isDirectlyImported ?? false,
     exploitAvailable,
     fixAvailable,
     depth,
@@ -55,6 +56,7 @@ export function scoreMatch(match: AdvisoryMatch): ScoredVulnerability {
       cvssScore,
       cvssVector,
       productionReachable: match.isProduction,
+      directlyImported: match.isDirectlyImported ?? false,
       exploitAvailable,
       fixAvailable,
       fixVersion: advisory.fixVersion,
@@ -78,6 +80,7 @@ export function scoreAllMatches(matches: AdvisoryMatch[]): ScoredVulnerability[]
 function computeCompositeScore(factors: {
   cvssScore: number;
   isProduction: boolean;
+  isDirectlyImported: boolean;
   exploitAvailable: boolean;
   fixAvailable: boolean;
   depth: number;
@@ -91,6 +94,11 @@ function computeCompositeScore(factors: {
   // Production reachability: massive weight (the key differentiator)
   if (factors.isProduction) {
     score += 30;
+  }
+
+  // Directly imported by application code: stronger reachability signal
+  if (factors.isDirectlyImported) {
+    score += 10;
   }
 
   // Exploit available: significant boost

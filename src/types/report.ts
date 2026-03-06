@@ -7,6 +7,7 @@ export type RiskScore = {
     cvssScore: number;
     cvssVector: string;
     productionReachable: boolean;
+    directlyImported: boolean;
     exploitAvailable: boolean;
     fixAvailable: boolean;
     fixVersion: string | null;

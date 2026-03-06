@@ -62,7 +62,7 @@ export type Advisory = {
   publishedAt: string;
   modifiedAt: string;
   references: { type: string; url: string }[];
-  source: 'osv-api' | 'bundled-index' | 'npm-bulk' | 'cache';
+  source: 'osv-api' | 'bundled-index' | 'npm-bulk' | 'cache' | 'offline-index';
 };
 
 export type AdvisoryMatch = {
@@ -72,4 +72,5 @@ export type AdvisoryMatch = {
   dependencyPath: string[];
   isProduction: boolean;
   workspaces?: string[]; // workspace names that use this package
+  isDirectlyImported?: boolean; // true if application source code imports this package
 };

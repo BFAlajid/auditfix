@@ -14,6 +14,10 @@ vi.mock('../../src/core/advisory/cache.js', () => ({
   getCachedPackageAdvisories: vi.fn().mockReturnValue(null),
 }));
 
+vi.mock('../../src/core/advisory/offline-index.js', () => ({
+  queryOfflineIndexBatch: vi.fn().mockReturnValue(new Map()),
+}));
+
 vi.mock('../../src/utils/logger.js', () => ({
   info: vi.fn(),
   warn: vi.fn(),

@@ -10,6 +10,7 @@ import { matchAdvisories } from './advisory/matcher.js';
 import { scoreAllMatches } from './advisory/scorer.js';
 import { loadLocalAllowList, applyAllowList } from './allowlist/local.js';
 import { detectWorkspaces, mapDepsToWorkspaces } from './workspace/detector.js';
+import { scanImportChains, isDirectlyImported } from './graph/import-chain.js';
 import * as logger from '../utils/logger.js';
 
 export type AnalyzeOptions = {
@@ -38,6 +39,9 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     logger.info(`Monorepo detected: ${wsConfig.workspaces.length} workspaces`);
     depToWorkspaces = mapDepsToWorkspaces(lockfileResult.graph, wsConfig.workspaces);
   }
+
+  // 2b. Scan import chains for reachability analysis
+  const importedPackages = scanImportChains(options.projectDir);
 
   // 3. Compute dependency paths
   computeDependencyPaths(lockfileResult.graph);
@@ -99,6 +103,11 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
         match.workspaces = [...ws];
       }
     }
+  }
+
+  // Annotate matches with import chain reachability
+  for (const match of allMatches) {
+    match.isDirectlyImported = isDirectlyImported(match.package, importedPackages);
   }
 
   logger.info(`Found ${allMatches.length} vulnerability matches`);
