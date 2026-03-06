@@ -1,0 +1,12 @@
+{
+  "name": "vulnerable-test-project",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "4.17.1",
+    "lodash": "4.17.20",
+    "jsonwebtoken": "8.5.1"
+  },
+  "devDependencies": {
+    "semver": "5.7.1"
+  }
+}
