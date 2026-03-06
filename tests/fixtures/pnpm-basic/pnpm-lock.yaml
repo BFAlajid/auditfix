@@ -1,0 +1,44 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.20
+        version: 4.17.20
+      express:
+        specifier: ^4.17.1
+        version: 4.17.1
+    devDependencies:
+      semver:
+        specifier: ^5.7.1
+        version: 5.7.1
+
+packages:
+  accepts@1.3.8:
+    resolution: {integrity: sha512-PYAthTa2m2VKxuv}
+    dependencies:
+      mime-types: 2.1.35
+
+  body-parser@1.19.0:
+    resolution: {integrity: sha512-dhEPsNaD6dG}
+
+  express@4.17.1:
+    resolution: {integrity: sha512-mHJ9O79Rqlup}
+    dependencies:
+      accepts: 1.3.8
+      body-parser: 1.19.0
+
+  lodash@4.17.20:
+    resolution: {integrity: sha512-PlhdFcillOIN}
+
+  mime-types@2.1.35:
+    resolution: {integrity: sha512-ZDY+bPm5zTTF}
+
+  semver@5.7.1:
+    resolution: {integrity: sha512-sauaDf/PZdVg}
+    dev: true

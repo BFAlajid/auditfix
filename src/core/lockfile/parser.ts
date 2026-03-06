@@ -6,6 +6,10 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LockfileParseResult } from '../../types/package.js';
 import { parseNpmLockfile } from './npm.js';
+import { parseYarnClassicLockfile } from './yarn-classic.js';
+import { parseYarnBerryLockfile } from './yarn-berry.js';
+import { parsePnpmLockfile } from './pnpm.js';
+import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
 
 const LOCKFILE_PRIORITY = [
@@ -19,7 +23,7 @@ export function detectAndParseLockfile(projectDir: string): LockfileParseResult 
     const lockfilePath = join(projectDir, lockfileName);
     if (existsSync(lockfilePath)) {
       logger.debug(`Found lockfile: ${lockfilePath}`);
-      return parseLockfile(lockfilePath, lockfileName);
+      return parseLockfile(projectDir, lockfilePath, lockfileName);
     }
   }
 
@@ -28,7 +32,7 @@ export function detectAndParseLockfile(projectDir: string): LockfileParseResult 
   );
 }
 
-function parseLockfile(path: string, filename: string): LockfileParseResult {
+function parseLockfile(projectDir: string, path: string, filename: string): LockfileParseResult {
   const content = readFileSync(path, 'utf-8');
 
   if (content.trim().length === 0) {
@@ -46,14 +50,49 @@ function parseLockfile(path: string, filename: string): LockfileParseResult {
       };
     }
     case 'yarn.lock': {
-      // TODO: Milestone 10 — Yarn parser
-      throw new Error('Yarn lockfile support is not yet implemented. Coming in v1.0.');
+      const manifest = readManifest(projectDir);
+      const isBerry = content.includes('__metadata');
+      if (isBerry) {
+        const result = parseYarnBerryLockfile(content, manifest);
+        return {
+          type: 'yarn-berry',
+          graph: result.graph,
+          packageCount: result.graph.size,
+          skipped: result.skipped,
+        };
+      } else {
+        const result = parseYarnClassicLockfile(content, manifest);
+        return {
+          type: 'yarn-classic',
+          graph: result.graph,
+          packageCount: result.graph.size,
+          skipped: result.skipped,
+        };
+      }
     }
     case 'pnpm-lock.yaml': {
-      // TODO: Milestone 10 — pnpm parser
-      throw new Error('pnpm lockfile support is not yet implemented. Coming in v1.0.');
+      const result = parsePnpmLockfile(content);
+      return {
+        type: result.type,
+        graph: result.graph,
+        packageCount: result.graph.size,
+        skipped: result.skipped,
+      };
     }
     default:
       throw new Error(`Unknown lockfile: ${filename}`);
+  }
+}
+
+function readManifest(projectDir: string): {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+} {
+  try {
+    const content = readFileSync(join(projectDir, 'package.json'), 'utf-8');
+    return safeJsonParse<Record<string, Record<string, string>>>(content);
+  } catch {
+    return {};
   }
 }

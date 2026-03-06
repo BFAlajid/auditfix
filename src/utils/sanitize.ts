@@ -2,6 +2,7 @@
  * Input sanitization utilities.
  * Strips prototype pollution keys, validates package names and versions.
  */
+import yaml from 'js-yaml';
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -41,4 +42,12 @@ const MAL_RE = /^MAL-\d{4}-\d+$/;
 
 export function isValidAdvisoryId(id: string): boolean {
   return GHSA_RE.test(id) || CVE_RE.test(id) || MAL_RE.test(id) || id.startsWith('PYSEC-') || id.startsWith('RUSTSEC-');
+}
+
+/** Safe YAML parser using js-yaml v4+ (no !!js/function RCE). */
+export function safeYamlParse(content: string): unknown {
+  return yaml.load(stripBom(content), {
+    schema: yaml.DEFAULT_SCHEMA,
+    json: true,
+  });
 }
