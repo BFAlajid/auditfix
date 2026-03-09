@@ -5,7 +5,9 @@
  * since yarn.lock has no dev/prod flags.
  */
 import type { DependencyGraph, DependencyNode, SkippedDependency } from '../../types/package.js';
-import { parse as parseYarnLock } from '@yarnpkg/lockfile';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { parse: parseYarnLock } = require('@yarnpkg/lockfile');
 import { isValidVersion } from '../../utils/semver.js';
 import * as logger from '../../utils/logger.js';
 
