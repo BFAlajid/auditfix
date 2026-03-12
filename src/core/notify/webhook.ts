@@ -20,8 +20,11 @@ export async function sendWebhook(
   report: AuditReport,
   projectName?: string,
 ): Promise<WebhookResult> {
-  const isSlack = webhookUrl.includes('hooks.slack.com') || webhookUrl.includes('hooks.slack-gov.com');
-  const body = isSlack ? buildSlackPayload(report, projectName) : buildGenericPayload(report, projectName);
+  const platform = detectPlatform(webhookUrl);
+  const body = platform === 'slack' ? buildSlackPayload(report, projectName)
+    : platform === 'teams' ? buildTeamsPayload(report, projectName)
+    : platform === 'discord' ? buildDiscordPayload(report, projectName)
+    : buildGenericPayload(report, projectName);
 
   try {
     const response = await fetch(webhookUrl, {
@@ -42,6 +45,104 @@ export async function sendWebhook(
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, error: msg };
   }
+}
+
+export function detectPlatform(url: string): 'slack' | 'teams' | 'discord' | 'generic' {
+  if (url.includes('hooks.slack.com') || url.includes('hooks.slack-gov.com')) return 'slack';
+  if (url.includes('webhook.office.com') || url.includes('outlook.office.com')) return 'teams';
+  if (url.includes('discord.com/api/webhooks')) return 'discord';
+  return 'generic';
+}
+
+function severityColor(report: AuditReport): string {
+  const crit = report.vulnerabilities.some(v => v.risk.label === 'critical');
+  const high = report.vulnerabilities.some(v => v.risk.label === 'high');
+  if (crit) return 'FF0000';
+  if (high) return 'FF8C00';
+  if (report.vulnerabilities.length > 0) return 'FFD700';
+  return '00CC00';
+}
+
+function vulnSummary(report: AuditReport) {
+  const total = report.vulnerabilities.length;
+  const prod = report.vulnerabilities.filter(v => v.match.isProduction).length;
+  const crit = report.vulnerabilities.filter(v => v.risk.label === 'critical').length;
+  const high = report.vulnerabilities.filter(v => v.risk.label === 'high').length;
+  const med = report.vulnerabilities.filter(v => v.risk.label === 'medium').length;
+  const low = report.vulnerabilities.filter(v => v.risk.label === 'low').length;
+  return { total, prod, crit, high, med, low };
+}
+
+function buildTeamsPayload(report: AuditReport, projectName?: string) {
+  const s = vulnSummary(report);
+  const color = severityColor(report);
+  const title = s.total === 0
+    ? `No vulnerabilities found${projectName ? ` in ${projectName}` : ''}`
+    : `${s.total} vulnerabilities found${projectName ? ` in ${projectName}` : ''}`;
+
+  const facts = [
+    { name: 'Packages', value: String(report.metadata.totalPackages) },
+    { name: 'Critical', value: String(s.crit) },
+    { name: 'High', value: String(s.high) },
+    { name: 'Medium', value: String(s.med) },
+    { name: 'Low', value: String(s.low) },
+    { name: 'Production', value: String(s.prod) },
+    { name: 'Confidence', value: report.metadata.confidence },
+  ];
+
+  const payload: Record<string, unknown> = {
+    '@type': 'MessageCard',
+    '@context': 'https://schema.org/extensions',
+    themeColor: color,
+    summary: title,
+    sections: [{
+      activityTitle: `auditfix: ${title}`,
+      facts,
+      markdown: true,
+    }],
+  };
+
+  const ghRepo = process.env.GITHUB_REPOSITORY;
+  if (ghRepo) {
+    payload.potentialAction = [{
+      '@type': 'OpenUri',
+      name: 'View on GitHub',
+      targets: [{ os: 'default', uri: `https://github.com/${ghRepo}/security` }],
+    }];
+  }
+
+  return payload;
+}
+
+function buildDiscordPayload(report: AuditReport, projectName?: string) {
+  const s = vulnSummary(report);
+  const color = parseInt(severityColor(report), 16);
+  const title = s.total === 0
+    ? `No vulnerabilities found${projectName ? ` in ${projectName}` : ''}`
+    : `${s.total} vulnerabilities found${projectName ? ` in ${projectName}` : ''}`;
+
+  const description = [
+    `**Packages scanned:** ${report.metadata.totalPackages}`,
+    `**Critical:** ${s.crit} | **High:** ${s.high} | **Medium:** ${s.med} | **Low:** ${s.low}`,
+    `**Production:** ${s.prod} | **Confidence:** ${report.metadata.confidence}`,
+  ].join('\n');
+
+  const fields = report.vulnerabilities.slice(0, 5).map(v => ({
+    name: `${v.risk.label.toUpperCase()}: ${v.match.package}@${v.match.installedVersion}`,
+    value: `${v.match.advisory.id} (score: ${v.risk.score})${v.risk.factors.fixVersion ? ` → fix: ${v.risk.factors.fixVersion}` : ''}`,
+    inline: false,
+  }));
+
+  return {
+    embeds: [{
+      title: `auditfix: ${title}`,
+      description,
+      color,
+      fields,
+      footer: { text: `auditfix | ${report.metadata.advisorySource}` },
+      timestamp: new Date().toISOString(),
+    }],
+  };
 }
 
 function buildSlackPayload(report: AuditReport, projectName?: string) {

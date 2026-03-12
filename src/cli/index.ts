@@ -4,11 +4,12 @@
  */
 import { Command, Option } from 'commander';
 import { existsSync, statSync } from 'node:fs';
+import type { AuditReport } from '../types/report.js';
 import { analyze } from '../core/analyzer.js';
 import { loadConfig } from '../core/config.js';
 import { renderTerminalReport, getExitCode, getExitCodeForStrategy } from './output/terminal.js';
 import { renderJsonReport } from './output/json.js';
-import { renderSarifReport } from './output/sarif.js';
+import { renderSarifReport, renderSarifDiffReport } from './output/sarif.js';
 import { generateSbom } from './output/sbom.js';
 import { addToAllowList } from '../core/allowlist/local.js';
 import { planFixes } from '../core/fixer/safe-update.js';
@@ -19,6 +20,7 @@ import { detectAndParseLockfile } from '../core/lockfile/parser.js';
 import { scanInstallScripts } from '../core/scanner/install-scripts.js';
 import { scanLicenses } from '../core/scanner/license-checker.js';
 import { sendWebhook } from '../core/notify/webhook.js';
+import { postPrComment } from '../core/notify/pr-comment.js';
 import { checkDepAge } from '../core/scanner/dep-age.js';
 import { detectTyposquats } from '../core/scanner/typosquat.js';
 import { checkProvenance } from '../core/scanner/provenance.js';
@@ -62,6 +64,8 @@ program
   .option('--check-provenance', 'Check npm package provenance attestations', false)
   .option('--scan-behavior', 'Deep scan package source for suspicious behavior patterns', false)
   .option('--vex', 'Generate OpenVEX document from scan results', false)
+  .option('--sarif-baseline <path>', 'SARIF diff mode: only output NEW vulns not in baseline JSON report')
+  .option('--pr-comment', 'Post scan results as a GitHub PR comment (requires GITHUB_TOKEN)', false)
   .option('--webhook <url>', 'Send results to a webhook URL (Slack or generic)')
   .option('--watch', 'Watch lockfile for changes and re-scan', false)
   .option('--verbose', 'Enable debug logging', false)
@@ -165,7 +169,19 @@ program
       const outputFormat = options.ci ? 'json' : config.output;
 
       if (outputFormat === 'sarif') {
-        console.log(renderSarifReport(report, VERSION));
+        if (options.sarifBaseline) {
+          const baselinePath = path.resolve(options.sarifBaseline);
+          try {
+            const baselineJson = readFileSync(baselinePath, 'utf-8');
+            const baseline = safeJsonParse<AuditReport>(baselineJson);
+            console.log(renderSarifDiffReport(report, baseline, VERSION));
+          } catch (err) {
+            logger.error(`Failed to read SARIF baseline: ${err instanceof Error ? err.message : err}`);
+            process.exit(2);
+          }
+        } else {
+          console.log(renderSarifReport(report, VERSION));
+        }
       } else if (outputFormat === 'json') {
         console.log(renderJsonReport(report));
       } else {
@@ -307,6 +323,16 @@ program
         const webhookResult = await sendWebhook(options.webhook, report, projectName);
         if (!webhookResult.success) {
           logger.warn(`Webhook notification failed: ${webhookResult.error}`);
+        }
+      }
+
+      // Post PR comment if requested
+      if (options.prComment) {
+        const prResult = await postPrComment(report);
+        if (prResult.success) {
+          logger.info(`PR comment posted: ${prResult.commentUrl}`);
+        } else {
+          logger.warn(`PR comment failed: ${prResult.error}`);
         }
       }
 

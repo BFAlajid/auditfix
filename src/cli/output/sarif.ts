@@ -167,3 +167,29 @@ export function renderSarifReport(report: AuditReport, version: string): string 
 
   return JSON.stringify(sarif, null, 2);
 }
+
+/**
+ * Render a SARIF report containing only NEW vulnerabilities not in the baseline.
+ * Matches by advisory ID + package + version.
+ */
+export function renderSarifDiffReport(
+  current: AuditReport,
+  baseline: AuditReport,
+  version: string,
+): string {
+  const baselineKeys = new Set(
+    baseline.vulnerabilities.map(
+      (v) => `${v.match.advisory.id}:${v.match.package}@${v.match.installedVersion}`,
+    ),
+  );
+
+  const filtered: AuditReport = {
+    ...current,
+    vulnerabilities: current.vulnerabilities.filter((v) => {
+      const key = `${v.match.advisory.id}:${v.match.package}@${v.match.installedVersion}`;
+      return !baselineKeys.has(key);
+    }),
+  };
+
+  return renderSarifReport(filtered, version);
+}
