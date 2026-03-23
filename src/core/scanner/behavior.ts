@@ -51,6 +51,16 @@ const BEHAVIOR_PATTERNS: Array<{
   { name: 'hex-strings', pattern: /\\x[0-9a-fA-F]{2}(?:\\x[0-9a-fA-F]{2}){10,}/g, description: 'Long hex-encoded strings (potential obfuscation)', risk: 'high' },
   { name: 'base64-decode', pattern: /(?:atob|Buffer\.from)\s*\(\s*['"][A-Za-z0-9+/=]{50,}['"]/g, description: 'Decodes long base64 string', risk: 'high' },
   { name: 'char-code', pattern: /String\.fromCharCode\s*\([^)]{20,}\)/g, description: 'String.fromCharCode with many characters (obfuscation)', risk: 'high' },
+
+  // Supply chain attack patterns
+  { name: 'ci-env-gate', pattern: /process\.env\.(?:CI|GITHUB_ACTIONS|GITLAB_CI|TRAVIS|JENKINS|CIRCLECI)\b/g, description: 'Checks for CI environment variables (potential conditional activation)', risk: 'medium' },
+  { name: 'delayed-exec', pattern: /setTimeout\s*\([^,]+,\s*\d{5,}\)/g, description: 'Long delayed execution (>10s timer, potential evasion technique)', risk: 'high' },
+  { name: 'crypto-mining', pattern: /stratum\+tcp|cryptonight|coinhive|monero|xmrig/gi, description: 'Cryptocurrency mining indicators', risk: 'critical' },
+  { name: 'exfil-service', pattern: /webhook\.site|requestbin\.com|pipedream\.net|ngrok\.io|burpcollaborator/gi, description: 'Known data exfiltration service URL', risk: 'critical' },
+  { name: 'credential-paths', pattern: /\.npmrc|\.ssh\/id_|authorized_keys|\.gnupg|\.aws\/credentials/g, description: 'References credential or key file paths', risk: 'critical' },
+  { name: 'dynamic-url-exfil', pattern: /https?:\/\/[^'"]*\$\{?process\.env/g, description: 'Constructs URL using environment variable data', risk: 'critical' },
+  { name: 'wasm-load', pattern: /WebAssembly\.(?:instantiate|compile|Instance)/g, description: 'WebAssembly loading (opaque binary execution)', risk: 'medium' },
+  { name: 'geoip', pattern: /geoip|ip-api\.com|ipinfo\.io|maxmind|freegeoip/gi, description: 'IP geolocation lookup (potential geofenced payload)', risk: 'high' },
 ];
 
 const JS_EXTENSIONS = new Set(['.js', '.mjs', '.cjs']);

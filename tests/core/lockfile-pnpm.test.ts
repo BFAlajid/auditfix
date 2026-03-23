@@ -102,4 +102,62 @@ packages:
     expect(graph.has('lodash@4.17.20')).toBe(true);
     expect(skipped.some(s => s.reason === 'workspace')).toBe(true);
   });
+
+  it('parses pnpm monorepo with multiple importers', () => {
+    const content = `
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      shared-lib:
+        specifier: ^1.0.0
+        version: 1.0.0
+  packages/app:
+    dependencies:
+      express:
+        specifier: ^4.18.0
+        version: 4.18.0
+    devDependencies:
+      vitest:
+        specifier: ^1.0.0
+        version: 1.0.0
+  packages/utils:
+    dependencies:
+      lodash:
+        specifier: ^4.17.21
+        version: 4.17.21
+
+packages:
+  shared-lib@1.0.0:
+    resolution: {integrity: sha512-shared}
+
+  express@4.18.0:
+    resolution: {integrity: sha512-express}
+
+  vitest@1.0.0:
+    resolution: {integrity: sha512-vitest}
+    dev: true
+
+  lodash@4.17.21:
+    resolution: {integrity: sha512-lodash}
+`;
+    const { graph } = parsePnpmLockfile(content);
+
+    const express = graph.get('express@4.18.0')!;
+    expect(express).toBeDefined();
+    expect(express.isProduction).toBe(true);
+
+    const vitest = graph.get('vitest@1.0.0')!;
+    expect(vitest).toBeDefined();
+    expect(vitest.isProduction).toBe(false);
+
+    const lodash = graph.get('lodash@4.17.21')!;
+    expect(lodash).toBeDefined();
+    expect(lodash.isProduction).toBe(true);
+
+    const sharedLib = graph.get('shared-lib@1.0.0')!;
+    expect(sharedLib).toBeDefined();
+    expect(sharedLib.isProduction).toBe(true);
+  });
 });

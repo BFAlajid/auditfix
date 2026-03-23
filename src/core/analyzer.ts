@@ -5,7 +5,7 @@
 import type { AuditReport, ScanMetadata, ConfidenceLevel, RiskScore } from '../types/report.js';
 import { detectAndParseLockfile } from './lockfile/parser.js';
 import { computeDependencyPaths } from './graph/reachability.js';
-import { resolveAdvisories, AdvisoryResolutionError } from './advisory/resolver.js';
+import { resolveAdvisories, resolveAdvisoriesWithCache, AdvisoryResolutionError } from './advisory/resolver.js';
 import { matchAdvisories } from './advisory/matcher.js';
 import { scoreAllMatches } from './advisory/scorer.js';
 import type { ScorerContext } from './advisory/scorer.js';
@@ -20,6 +20,7 @@ export type AnalyzeOptions = {
   productionOnly: boolean;
   severityThreshold?: RiskScore['label'];
   workspace?: string; // filter to a specific workspace
+  noCache?: boolean;  // bypass advisory cache
 };
 
 export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
@@ -55,7 +56,7 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
   let advisories: Map<string, import('../types/advisory.js').Advisory[]>;
 
   try {
-    const resolved = await resolveAdvisories(lockfileResult.graph);
+    const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache });
     advisories = resolved.advisories;
     advisorySource = resolved.source;
     confidence = resolved.confidence;

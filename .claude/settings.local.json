@@ -17,7 +17,9 @@
       "Bash(gh repo:*)",
       "Bash(mkdir:*)",
       "Bash(gh run:*)",
-      "Bash(npx eslint:*)"
+      "Bash(npx eslint:*)",
+      "Bash(mkdir -p \"C:\\\\Users\\\\User\\\\Documents\\\\BunjiDocs\\\\auditfix\\\\src\\\\core\\\\policy\")",
+      "Bash(mkdir -p \"C:\\\\Users\\\\User\\\\Documents\\\\BunjiDocs\\\\auditfix\\\\tests\\\\core\\\\policy\")"
     ]
   }
 }

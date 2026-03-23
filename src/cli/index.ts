@@ -26,6 +26,9 @@ import { detectTyposquats } from '../core/scanner/typosquat.js';
 import { checkProvenance } from '../core/scanner/provenance.js';
 import { scanBehavior } from '../core/scanner/behavior.js';
 import { generateVex } from './output/vex.js';
+import { loadPolicy } from '../core/policy/loader.js';
+import { evaluatePolicy } from '../core/policy/evaluator.js';
+import { aggregateFindings } from '../core/policy/findings.js';
 import { diffReports } from '../core/diff.js';
 import { isValidAdvisoryId } from '../utils/sanitize.js';
 import { setLogLevel } from '../utils/logger.js';
@@ -66,6 +69,9 @@ program
   .option('--vex', 'Generate OpenVEX document from scan results', false)
   .option('--sarif-baseline <path>', 'SARIF diff mode: only output NEW vulns not in baseline JSON report')
   .option('--pr-comment', 'Post scan results as a GitHub PR comment (requires GITHUB_TOKEN)', false)
+  .option('--policy <path>', 'Path to policy file (auto-detects .auditfix-policy.yml)')
+  .option('--no-policy', 'Skip policy evaluation')
+  .option('--no-cache', 'Bypass advisory cache')
   .option('--webhook <url>', 'Send results to a webhook URL (Slack or generic)')
   .option('--watch', 'Watch lockfile for changes and re-scan', false)
   .option('--verbose', 'Enable debug logging', false)
@@ -163,6 +169,7 @@ program
         productionOnly: config.productionOnly,
         severityThreshold: config.severity,
         workspace: options.workspace,
+        noCache: options.cache === false,
       });
 
       // CI mode forces JSON output
@@ -333,6 +340,39 @@ program
           logger.info(`PR comment posted: ${prResult.commentUrl}`);
         } else {
           logger.warn(`PR comment failed: ${prResult.error}`);
+        }
+      }
+
+      // Evaluate policy if present
+      if (options.policy !== false) {
+        try {
+          const policyPath = typeof options.policy === 'string' ? options.policy : undefined;
+          const policy = await loadPolicy(options.dir, policyPath);
+          if (policy) {
+            const findings = aggregateFindings(report);
+            const policyResult = evaluatePolicy(policy, findings);
+            if (!policyResult.passed) {
+              console.log('');
+              console.log(chalk.bold.red(`Policy violations (${policyResult.violations.length}):`));
+              for (const v of policyResult.violations) {
+                console.log(chalk.red(`  FAIL  ${v.finding.package}@${v.finding.version} — ${v.rule.name}`));
+              }
+            }
+            if (policyResult.warnings.length > 0) {
+              console.log('');
+              console.log(chalk.bold.yellow(`Policy warnings (${policyResult.warnings.length}):`));
+              for (const w of policyResult.warnings) {
+                console.log(chalk.yellow(`  WARN  ${w.finding.package}@${w.finding.version} — ${w.rule.name}`));
+              }
+            }
+            if (!policyResult.passed) {
+              process.exit(1);
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error(`Policy evaluation failed: ${msg}`);
+          process.exit(2);
         }
       }
 

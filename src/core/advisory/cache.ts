@@ -21,6 +21,11 @@ import type { Advisory } from '../../types/advisory.js';
 import { isValidAdvisoryId, safeJsonParse } from '../../utils/sanitize.js';
 
 const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+const CACHE_FRESH_MS = 1 * 60 * 60 * 1000; // 1 hour — serve without refresh
+const CACHE_STALE_MS = 4 * 60 * 60 * 1000; // 4 hours — serve but trigger background refresh
+const CACHE_EXPIRED_MS = 24 * 60 * 60 * 1000; // 24 hours — fallback only
+
+export type CacheFreshness = 'fresh' | 'stale' | 'expired' | 'missing';
 const HMAC_ALGORITHM = 'sha256';
 const WINDOWS_RESERVED_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
@@ -365,4 +370,83 @@ export function getCacheStats(
   } catch {
     return { entries: 0, totalSize: 0, oldestEntry: null };
   }
+}
+
+// --- Cache-first resolution helpers ---
+
+/**
+ * Read a verified cache entry with extended tolerance for stale-while-revalidate.
+ * Returns the entry even if it's past TTL but within CACHE_EXPIRED_MS (24h).
+ * The caller determines freshness via getCacheFreshness().
+ */
+function readVerifiedEntryWithStaleTolerance(filePath: string, hmacKey: Buffer): CacheEntry | null {
+  try {
+    if (isSymlink(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const entry = safeJsonParse<CacheEntry>(raw);
+    if (
+      typeof entry.timestamp !== 'number' ||
+      typeof entry.hmac !== 'string' ||
+      entry.data === undefined ||
+      entry.data === null
+    ) {
+      return null;
+    }
+    const payload = JSON.stringify(entry.data) + '|' + String(entry.timestamp);
+    const expectedHmac = computeHmac(payload, hmacKey);
+    if (!crypto.timingSafeEqual(Buffer.from(entry.hmac, 'hex'), Buffer.from(expectedHmac, 'hex'))) {
+      return null;
+    }
+    // Accept up to 24h (expired) — caller checks freshness
+    if (Date.now() - entry.timestamp > CACHE_EXPIRED_MS) {
+      return null;
+    }
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Determine cache freshness tier.
+ */
+export function getCacheFreshness(timestamp: number): CacheFreshness {
+  const age = Date.now() - timestamp;
+  if (age < CACHE_FRESH_MS) return 'fresh';
+  if (age < CACHE_STALE_MS) return 'stale';
+  if (age < CACHE_EXPIRED_MS) return 'expired';
+  return 'missing';
+}
+
+/**
+ * Attempt to read cached advisories for a set of package names.
+ * Returns a Map of results and the overall freshness tier.
+ * If ANY package is missing from cache, returns null.
+ */
+export function readCachedAdvisoriesForPackages(
+  packageNames: string[],
+  cacheDir: string = getDefaultCacheDir(),
+): { advisories: Map<string, Advisory[]>; freshness: CacheFreshness } | null {
+  const hmacKey = getHmacKey(cacheDir);
+  const results = new Map<string, Advisory[]>();
+  let worstFreshness: CacheFreshness = 'fresh';
+  const freshnessOrder: CacheFreshness[] = ['fresh', 'stale', 'expired', 'missing'];
+
+  for (const name of packageNames) {
+    if (!validatePackageName(name)) return null;
+    const filePath = buildPackagePath(name, cacheDir);
+    if (!filePath) return null;
+
+    const entry = readVerifiedEntryWithStaleTolerance(filePath, hmacKey);
+    if (!entry) return null; // Missing or invalid
+
+    const freshness = getCacheFreshness(entry.timestamp);
+    if (freshnessOrder.indexOf(freshness) > freshnessOrder.indexOf(worstFreshness)) {
+      worstFreshness = freshness;
+    }
+
+    results.set(name, entry.data as Advisory[]);
+  }
+
+  return { advisories: results, freshness: worstFreshness };
 }

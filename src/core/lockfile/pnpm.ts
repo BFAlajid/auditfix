@@ -76,17 +76,45 @@ export function parsePnpmLockfile(content: string): {
   const graph: DependencyGraph = new Map();
   const skipped: SkippedDependency[] = [];
 
-  // Determine root deps (from importers or top-level)
-  const rootImporter = lockfile.importers?.['.'] ?? {
-    dependencies: lockfile.dependencies,
-    devDependencies: lockfile.devDependencies,
-    optionalDependencies: lockfile.optionalDependencies,
-  };
+  // Determine root deps from ALL importers (monorepo support).
+  // For monorepos, pnpm has multiple importers (e.g. '.', 'packages/app', 'packages/utils').
+  // We union dependencies across all importers. A package that is a production dep in ANY
+  // importer is considered production (production takes precedence over dev).
+  const importers: PnpmImporter[] = [];
+  if (lockfile.importers && typeof lockfile.importers === 'object') {
+    for (const importer of Object.values(lockfile.importers)) {
+      if (importer && typeof importer === 'object') {
+        importers.push(importer as PnpmImporter);
+      }
+    }
+  }
+  // Fallback: if no importers, use top-level fields (pnpm v5 compat)
+  if (importers.length === 0) {
+    importers.push({
+      dependencies: lockfile.dependencies,
+      devDependencies: lockfile.devDependencies,
+      optionalDependencies: lockfile.optionalDependencies,
+    });
+  }
 
-  // Build set of production/dev/optional root dep names
-  const prodRootNames = new Set(Object.keys(rootImporter.dependencies ?? {}));
-  const devRootNames = new Set(Object.keys(rootImporter.devDependencies ?? {}));
-  const optionalRootNames = new Set(Object.keys(rootImporter.optionalDependencies ?? {}));
+  const prodRootNames = new Set<string>();
+  const devRootNames = new Set<string>();
+  const optionalRootNames = new Set<string>();
+  for (const importer of importers) {
+    for (const name of Object.keys(importer.dependencies ?? {})) {
+      prodRootNames.add(name);
+    }
+    for (const name of Object.keys(importer.devDependencies ?? {})) {
+      devRootNames.add(name);
+    }
+    for (const name of Object.keys(importer.optionalDependencies ?? {})) {
+      optionalRootNames.add(name);
+    }
+  }
+  // Production takes precedence: if a package is a prod dep in any importer, remove from dev
+  for (const name of prodRootNames) {
+    devRootNames.delete(name);
+  }
 
   // First pass: create nodes
   for (const [pkgKey, entry] of Object.entries(packages)) {

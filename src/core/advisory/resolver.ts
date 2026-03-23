@@ -16,6 +16,7 @@ import { fetchNpmAdvisories } from './source-npm.js';
 import {
   cacheAdvisoryBatch,
   getCachedPackageAdvisories,
+  readCachedAdvisoriesForPackages,
 } from './cache.js';
 import { queryOfflineIndexBatch } from './offline-index.js';
 import * as logger from '../../utils/logger.js';
@@ -139,6 +140,62 @@ export class AdvisoryResolutionError extends Error {
     this.name = 'AdvisoryResolutionError';
     this.errors = errors;
   }
+}
+
+/**
+ * Cache-first advisory resolution. Checks per-package cache before hitting the network.
+ * - Fresh (<1h): return immediately, zero network calls
+ * - Stale (1-4h): return immediately, trigger background refresh
+ * - Cold/missing: fall back to resolveAdvisories() (full network flow)
+ */
+export async function resolveAdvisoriesWithCache(
+  graph: DependencyGraph,
+  options?: { noCache?: boolean },
+): Promise<ResolverResult> {
+  if (options?.noCache) {
+    return resolveAdvisories(graph);
+  }
+
+  // Collect unique package names
+  const packageNames: string[] = [];
+  const seen = new Set<string>();
+  for (const [, node] of graph) {
+    if (!seen.has(node.name)) {
+      seen.add(node.name);
+      packageNames.push(node.name);
+    }
+  }
+
+  // Try reading all from cache
+  const cached = readCachedAdvisoriesForPackages(packageNames);
+  if (cached) {
+    if (cached.freshness === 'fresh') {
+      logger.info(`All ${packageNames.length} packages served from fresh cache (<1h)`);
+      return {
+        advisories: cached.advisories,
+        source: 'Local cache (fresh)',
+        confidence: 'HIGH',
+        errors: [],
+      };
+    }
+
+    if (cached.freshness === 'stale') {
+      logger.info(`All ${packageNames.length} packages served from stale cache (1-4h), refreshing in background`);
+      // Trigger background refresh (don't await)
+      resolveAdvisories(graph).catch((err) => {
+        logger.debug(`Background cache refresh failed: ${err}`);
+      });
+      return {
+        advisories: cached.advisories,
+        source: 'Local cache (stale, refreshing)',
+        confidence: 'HIGH',
+        errors: [],
+      };
+    }
+  }
+
+  // Cold or missing — full network resolution
+  return resolveAdvisories(graph);
 }
 
 /**

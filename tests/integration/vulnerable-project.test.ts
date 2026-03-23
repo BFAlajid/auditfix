@@ -19,6 +19,7 @@ vi.mock('../../src/core/advisory/source-npm.js', () => ({
 vi.mock('../../src/core/advisory/cache.js', () => ({
   cacheAdvisoryBatch: vi.fn().mockResolvedValue(undefined),
   getCachedPackageAdvisories: vi.fn().mockReturnValue(null),
+  readCachedAdvisoriesForPackages: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock('../../src/utils/logger.js', () => ({
