@@ -10,6 +10,7 @@
  */
 import type { Advisory } from '../../types/advisory.js';
 import semver from 'semver';
+import * as logger from '../../utils/logger.js';
 
 export type OfflineEntry = {
   id: string;
@@ -23,23 +24,81 @@ export type OfflineEntry = {
 /**
  * Try to load the auto-generated index from the OSV bulk export.
  * Falls back to the hardcoded index if the generated file does not exist.
+ *
+ * Distinguish "module not present" (expected on fresh installs) from
+ * "load threw an error" (worth retrying on the next call).
  */
 let generatedIndex: OfflineEntry[] | null = null;
 let generatedLoaded = false;
 
+const MODULE_NOT_FOUND_CODES = new Set(['ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND']);
+
+function isModuleNotFound(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && MODULE_NOT_FOUND_CODES.has(code);
+}
+
+/**
+ * Default loader — dynamic-imports the generated index. Swappable for tests
+ * via `__testable.setLoader`.
+ */
+type GeneratedIndexLoader = () => Promise<OfflineEntry[] | null>;
+
+const defaultLoader: GeneratedIndexLoader = async () => {
+  // @ts-expect-error — generated file may not exist; handled by caller
+  const mod = await import('./offline-index.generated.js');
+  if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
+    return mod.GENERATED_INDEX as OfflineEntry[];
+  }
+  return null;
+};
+
+let activeLoader: GeneratedIndexLoader = defaultLoader;
+
 async function loadGeneratedIndex(): Promise<OfflineEntry[] | null> {
   if (generatedLoaded) return generatedIndex;
-  generatedLoaded = true;
   try {
-    // @ts-expect-error — generated file may not exist; handled by catch
-    const mod = await import('./offline-index.generated.js');
-    if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
-      generatedIndex = mod.GENERATED_INDEX;
+    const loaded = await activeLoader();
+    if (loaded) generatedIndex = loaded;
+    generatedLoaded = true;
+  } catch (err) {
+    // Missing generated file is the expected fresh-install path — accept
+    // the hardcoded fallback and never retry.
+    if (isModuleNotFound(err)) {
+      generatedLoaded = true;
+      return generatedIndex;
     }
-  } catch {
-    // Generated file does not exist — fall back to built-in index
+    // Any other failure is transient (e.g. FS flake, permissions). Keep
+    // `generatedLoaded` false so the next call re-attempts the import.
+    logger.debug(
+      `offline-index: generated load failed (will retry): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
   }
   return generatedIndex;
+}
+
+/**
+ * Test-only seam. NOT part of the public API. Lets tests inject a custom
+ * loader to exercise retry paths without resorting to import-mocking tricks.
+ */
+export const __testable = {
+  setLoader(loader: GeneratedIndexLoader): void {
+    activeLoader = loader;
+  },
+  resetLoader(): void {
+    activeLoader = defaultLoader;
+  },
+};
+
+/** Reset the generated-index load state. Intended for tests. */
+export function resetOfflineIndexState(): void {
+  generatedIndex = null;
+  generatedLoaded = false;
+  indexReady = null;
+  indexLoadFailures = 0;
+  BUILTIN_INDEX = HARDCODED_INDEX;
 }
 
 /**
@@ -86,14 +145,53 @@ function buildEffectiveIndex(gen: OfflineEntry[] | null): OfflineEntry[] {
 // Synchronous fallback used immediately; enriched lazily
 let BUILTIN_INDEX: OfflineEntry[] = HARDCODED_INDEX;
 
-// Attempt to load generated index on first async call
+// Attempt to load generated index on first async call.
+//
+// If the in-flight load rejects we must clear `indexReady` so the next caller
+// re-runs the load. Otherwise one transient failure (FS hiccup, permissions
+// race on first bundle extract) silently disables the generated index for
+// the entire process lifetime. After MAX_INDEX_LOAD_FAILURES consecutive
+// failures we stop retrying — the hardcoded fallback stays in place so
+// scans keep working.
 let indexReady: Promise<void> | null = null;
+let indexLoadFailures = 0;
+const MAX_INDEX_LOAD_FAILURES = 3;
+
 function ensureIndex(): Promise<void> {
-  if (!indexReady) {
-    indexReady = loadGeneratedIndex().then((gen) => {
-      BUILTIN_INDEX = buildEffectiveIndex(gen);
-    });
+  if (indexReady) return indexReady;
+
+  // Once we give up retrying we resolve immediately with the hardcoded
+  // fallback that's already in BUILTIN_INDEX.
+  if (indexLoadFailures >= MAX_INDEX_LOAD_FAILURES) {
+    indexReady = Promise.resolve();
+    return indexReady;
   }
+
+  indexReady = (async () => {
+    try {
+      const gen = await loadGeneratedIndex();
+      BUILTIN_INDEX = buildEffectiveIndex(gen);
+      indexLoadFailures = 0;
+    } catch (err) {
+      indexLoadFailures += 1;
+      logger.debug(
+        `offline-index: load attempt ${indexLoadFailures} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Clear the cached promise so the next caller retries, unless we've
+      // now hit the ceiling.
+      if (indexLoadFailures < MAX_INDEX_LOAD_FAILURES) {
+        indexReady = null;
+      } else {
+        logger.warn(
+          `offline-index: generated load failed ${indexLoadFailures} times; using hardcoded fallback`,
+        );
+      }
+      // Scanning must never abort because the *optional* generated index
+      // could not be loaded — resolve successfully with whatever
+      // BUILTIN_INDEX currently is (hardcoded fallback).
+    }
+  })();
+
   return indexReady;
 }
 

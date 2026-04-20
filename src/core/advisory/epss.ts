@@ -4,6 +4,7 @@
  * Also checks CISA KEV (Known Exploited Vulnerabilities) catalog.
  */
 import * as logger from '../../utils/logger.js';
+import { fetchJsonWithValidation, FetchValidationError } from '../../utils/fetch.js';
 
 export type EpssScore = {
   cve: string;
@@ -19,42 +20,113 @@ export type KevEntry = {
   knownRansomwareCampaignUse: string;
 };
 
-let kevCache: Set<string> | null = null;
-let kevCacheTime = 0;
-const KEV_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const EPSS_MAX_BYTES = 10 * 1024 * 1024;   // 10MB — worst-case batch of 50 CVEs is ~20KB
+const KEV_MAX_BYTES = 20 * 1024 * 1024;    // 20MB — catalog is ~2MB today
+const EPSS_TIMEOUT_MS = 30_000;
+const KEV_TIMEOUT_MS = 30_000;
+const EPSS_BATCH_SIZE = 50;
+const EPSS_BATCH_CONCURRENCY = 5;
+
+// Resettable KEV cache — mutable container so tests / long-running analyze()
+// callers can reset freshness without module state leaking across invocations.
+export type KevCacheState = {
+  cache: Set<string> | null;
+  cachedAt: number;
+  ttlMs: number;
+  reset(): void;
+};
+
+function makeKevCache(ttlMs: number): KevCacheState {
+  const state: KevCacheState = {
+    cache: null,
+    cachedAt: 0,
+    ttlMs,
+    reset() {
+      state.cache = null;
+      state.cachedAt = 0;
+    },
+  };
+  return state;
+}
+
+const kevState: KevCacheState = makeKevCache(4 * 60 * 60 * 1000); // 4 hours
+
+/** Reset the in-memory KEV cache. Intended for tests and per-analyze-call freshness. */
+export function resetKevCache(): void {
+  kevState.reset();
+}
+
+/**
+ * Bounded-concurrency map — runs at most `concurrency` tasks in parallel.
+ * Preserves input order in the returned array.
+ */
+async function pMap<T, R>(
+  items: readonly T[],
+  fn: (item: T, index: number) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+type EpssApiResponse = {
+  data?: Array<{ cve: string; epss: string; percentile: string }>;
+};
+
+async function fetchEpssBatch(batch: string[]): Promise<EpssApiResponse['data']> {
+  const param = batch.join(',');
+  const url = `https://api.first.org/data/v1/epss?cve=${param}`;
+  try {
+    const data = await fetchJsonWithValidation<EpssApiResponse>(url, {
+      maxBytes: EPSS_MAX_BYTES,
+      timeoutMs: EPSS_TIMEOUT_MS,
+      contentType: 'application/json',
+    });
+    return data.data ?? [];
+  } catch (err) {
+    if (err instanceof FetchValidationError) {
+      logger.debug(`EPSS batch query failed (${err.kind}): ${err.message}`);
+    } else {
+      logger.debug(`EPSS batch query failed: ${err instanceof Error ? err.message : err}`);
+    }
+    return [];
+  }
+}
 
 /**
  * Batch-fetch EPSS scores for a list of CVE IDs.
+ * Batches run with bounded parallelism (concurrency = 5).
  */
 export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, EpssScore>> {
   const results = new Map<string, EpssScore>();
   if (cveIds.length === 0) return results;
 
-  // EPSS API supports comma-separated CVEs, batch in groups of 50
-  const BATCH_SIZE = 50;
-  for (let i = 0; i < cveIds.length; i += BATCH_SIZE) {
-    const batch = cveIds.slice(i, i + BATCH_SIZE);
-    try {
-      const param = batch.join(',');
-      const response = await fetch(
-        `https://api.first.org/data/v1/epss?cve=${param}`,
-        { signal: AbortSignal.timeout(10_000) },
-      );
-      if (!response.ok) continue;
+  const batches: string[][] = [];
+  for (let i = 0; i < cveIds.length; i += EPSS_BATCH_SIZE) {
+    batches.push(cveIds.slice(i, i + EPSS_BATCH_SIZE));
+  }
 
-      const data = await response.json() as {
-        data: Array<{ cve: string; epss: string; percentile: string }>;
-      };
+  const batchResults = await pMap(batches, fetchEpssBatch, EPSS_BATCH_CONCURRENCY);
 
-      for (const entry of data.data ?? []) {
-        results.set(entry.cve, {
-          cve: entry.cve,
-          epss: parseFloat(entry.epss),
-          percentile: parseFloat(entry.percentile),
-        });
-      }
-    } catch (err) {
-      logger.debug(`EPSS batch query failed: ${err instanceof Error ? err.message : err}`);
+  for (const data of batchResults) {
+    for (const entry of data ?? []) {
+      results.set(entry.cve, {
+        cve: entry.cve,
+        epss: parseFloat(entry.epss),
+        percentile: parseFloat(entry.percentile),
+      });
     }
   }
 
@@ -63,34 +135,35 @@ export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, Eps
 
 /**
  * Fetch the CISA KEV catalog and return a set of CVE IDs.
- * Cached for 4 hours.
+ * Cached for 4 hours. Call `resetKevCache()` to force a refresh.
  */
 export async function fetchKevCatalog(): Promise<Set<string>> {
-  if (kevCache && Date.now() - kevCacheTime < KEV_CACHE_TTL) {
-    return kevCache;
+  if (kevState.cache && Date.now() - kevState.cachedAt < kevState.ttlMs) {
+    return kevState.cache;
   }
 
   try {
-    const response = await fetch(
+    const data = await fetchJsonWithValidation<{ vulnerabilities?: Array<{ cveID: string }> }>(
       'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
-      { signal: AbortSignal.timeout(15_000) },
+      {
+        maxBytes: KEV_MAX_BYTES,
+        timeoutMs: KEV_TIMEOUT_MS,
+        contentType: 'application/json',
+      },
     );
-    if (!response.ok) {
-      logger.debug(`CISA KEV fetch failed: HTTP ${response.status}`);
-      return kevCache ?? new Set();
-    }
 
-    const data = await response.json() as {
-      vulnerabilities: Array<{ cveID: string }>;
-    };
-
-    kevCache = new Set(data.vulnerabilities.map(v => v.cveID));
-    kevCacheTime = Date.now();
-    logger.debug(`CISA KEV loaded: ${kevCache.size} entries`);
-    return kevCache;
+    const next = new Set((data.vulnerabilities ?? []).map((v) => v.cveID));
+    kevState.cache = next;
+    kevState.cachedAt = Date.now();
+    logger.debug(`CISA KEV loaded: ${next.size} entries`);
+    return next;
   } catch (err) {
-    logger.debug(`CISA KEV fetch failed: ${err instanceof Error ? err.message : err}`);
-    return kevCache ?? new Set();
+    if (err instanceof FetchValidationError) {
+      logger.debug(`CISA KEV fetch failed (${err.kind}): ${err.message}`);
+    } else {
+      logger.debug(`CISA KEV fetch failed: ${err instanceof Error ? err.message : err}`);
+    }
+    return kevState.cache ?? new Set();
   }
 }
 
