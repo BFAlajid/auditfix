@@ -3,7 +3,7 @@
  * Uses native GitHub Actions protocol (GITHUB_OUTPUT, ::warning::, etc.)
  * No @actions/core dependency required.
  */
-import { appendFileSync, writeFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { analyze } from '../src/core/analyzer.js';
@@ -12,9 +12,31 @@ import { renderJsonReport } from '../src/cli/output/json.js';
 import { postPrComment } from '../src/core/notify/pr-comment.js';
 import { sendWebhook } from '../src/core/notify/webhook.js';
 import { getExitCodeForStrategy } from '../src/cli/output/terminal.js';
-import type { AuditReport } from '../src/types/report.js';
 
 // ── GitHub Actions protocol helpers ────────────────────────────────────────
+
+/**
+ * Percent-encode data so untrusted content cannot break out of a workflow
+ * command line (e.g. `::warning::...`). Mirrors the encoding used by
+ * @actions/core's toolkit: %, CR, LF, and `::` must be escaped because
+ * Actions uses these characters to delimit commands.
+ *
+ * Applied to both the *message body* and to property *values* (e.g. title=).
+ */
+function encodeWorkflowCommand(value: string): string {
+  return String(value)
+    .replace(/%/g, '%25')
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A')
+    .replace(/::/g, '%3A%3A');
+}
+
+/** Additional escape for property values: comma and colon delimit props. */
+function encodeWorkflowCommandProperty(value: string): string {
+  return encodeWorkflowCommand(value)
+    .replace(/:/g, '%3A')
+    .replace(/,/g, '%2C');
+}
 
 function getInput(name: string): string {
   return process.env[`INPUT_${name.replace(/-/g, '_').toUpperCase()}`] ?? '';
@@ -32,17 +54,17 @@ function setOutput(name: string, value: string | number): void {
 }
 
 function setFailed(message: string): void {
-  console.log(`::error::${message}`);
+  console.log(`::error::${encodeWorkflowCommand(message)}`);
   process.exitCode = 1;
 }
 
 function warning(message: string, title?: string): void {
-  const titlePart = title ? ` title=${title}` : '';
-  console.log(`::warning${titlePart}::${message}`);
+  const titlePart = title ? ` title=${encodeWorkflowCommandProperty(title)}` : '';
+  console.log(`::warning${titlePart}::${encodeWorkflowCommand(message)}`);
 }
 
 function startGroup(name: string): void {
-  console.log(`::group::${name}`);
+  console.log(`::group::${encodeWorkflowCommand(name)}`);
 }
 
 function endGroup(): void {
@@ -59,13 +81,6 @@ async function uploadSarif(sarifContent: string, category: string): Promise<void
 
   if (!token || !repo || !sha || !ref) {
     warning('Cannot upload SARIF: missing GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_SHA, or GITHUB_REF');
-    return;
-  }
-
-  // Basic token format validation
-  const validTokenPattern = /^(ghp_|ghs_|github_pat_|v\d+\.)[A-Za-z0-9_]+$/;
-  if (!validTokenPattern.test(token)) {
-    warning('GITHUB_TOKEN does not match expected GitHub token format');
     return;
   }
 
@@ -88,7 +103,7 @@ async function uploadSarif(sarifContent: string, category: string): Promise<void
           ref,
           sarif: encoded,
           tool_name: 'auditfix',
-          checkout_uri: `file:///github/workspace`,
+          checkout_uri: `file://${process.cwd()}`,
         }),
         signal: AbortSignal.timeout(30_000),
       },
@@ -107,10 +122,27 @@ async function uploadSarif(sarifContent: string, category: string): Promise<void
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+const VALID_SEVERITIES: readonly Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
+type FailOn = 'production-critical' | 'production-high' | 'any' | 'none';
+const VALID_FAIL_ON: readonly FailOn[] = ['production-critical', 'production-high', 'any', 'none'];
+
 async function run(): Promise<void> {
   try {
-    const severity = getInput('severity') || 'low';
-    const failOn = getInput('fail-on') || 'any';
+    const severityRaw = getInput('severity') || 'low';
+    if (!(VALID_SEVERITIES as readonly string[]).includes(severityRaw)) {
+      setFailed(`Invalid severity: ${severityRaw}. Must be one of: ${VALID_SEVERITIES.join(', ')}`);
+      return;
+    }
+    const severity = severityRaw as Severity;
+
+    const failOnRaw = getInput('fail-on') || 'any';
+    if (!(VALID_FAIL_ON as readonly string[]).includes(failOnRaw)) {
+      setFailed(`Invalid fail-on: ${failOnRaw}. Must be one of: ${VALID_FAIL_ON.join(', ')}`);
+      return;
+    }
+    const failOn = failOnRaw as FailOn;
+
     const prodOnly = getBooleanInput('production-only');
     const workDir = resolve(getInput('working-directory') || '.');
     const generateSarif = getBooleanInput('sarif');
@@ -118,23 +150,6 @@ async function run(): Promise<void> {
     const jsonOutputPath = getInput('json-output');
     const webhookUrl = getInput('webhook-url');
     const sarifCategory = getInput('sarif-category') || 'auditfix';
-    const checkTyposquats = getBooleanInput('check-typosquats');
-    const checkProvenance = getBooleanInput('check-provenance');
-    const scanBehavior = getBooleanInput('scan-behavior');
-
-    // Validate severity input
-    const validSeverities = ['critical', 'high', 'medium', 'low', 'info'];
-    if (!validSeverities.includes(severity)) {
-      setFailed(`Invalid severity: ${severity}. Must be one of: ${validSeverities.join(', ')}`);
-      return;
-    }
-
-    // Validate fail-on input
-    const validFailOn = ['production-critical', 'production-high', 'any', 'none'];
-    if (!validFailOn.includes(failOn)) {
-      setFailed(`Invalid fail-on: ${failOn}. Must be one of: ${validFailOn.join(', ')}`);
-      return;
-    }
 
     // Run scan
     startGroup('Running auditfix scan');

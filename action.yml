@@ -51,7 +51,7 @@ inputs:
     required: false
     default: 'false'
   webhook-url:
-    description: 'Webhook URL for notifications'
+    description: 'Webhook URL for notifications (Slack/Teams/Discord/generic). Pass as a secret, never inline: webhook-url: ${{ secrets.TEAMS_WEBHOOK_URL }}'
     required: false
   version:
     description: 'auditfix version (default: latest)'

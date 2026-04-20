@@ -1,0 +1,60 @@
+name: Release
+
+# Fires on any semver-shaped tag (v1.2.3, v2.0.0-rc.1, etc.). Tag the release
+# from a green main; this workflow does not create tags.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Tight default; each job requests exactly what it needs.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm + release
+    runs-on: ubuntu-latest
+
+    # OIDC trusted publishing requires id-token: write. contents: write is
+    # needed so softprops/action-gh-release can attach the SBOM asset.
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          # Tells npm where to publish and what audience to use for the OIDC
+          # exchange with npmjs.com. No NPM_TOKEN secret required.
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - run: npm test
+
+      # Generate a CycloneDX SBOM from production dependencies. Attached to
+      # the GitHub release below so downstream consumers can verify the
+      # package's supply chain surface without re-running anything.
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.cdx.json --omit dev
+
+      # --provenance: emits a signed attestation via Sigstore so consumers
+      # can verify this tarball was built in *this* workflow run.
+      # --access public: required for the first publish of a public scoped
+      #   package; harmless for subsequent publishes of an unscoped one.
+      - name: Publish to npm (with provenance)
+        run: npm publish --provenance --access public
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: sbom.cdx.json
+          fail_on_unmatched_files: true

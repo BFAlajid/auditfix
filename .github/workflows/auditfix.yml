@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Run daily at 06:00 UTC
+    # Daily at 06:00 UTC.
     - cron: '0 6 * * *'
 
 permissions:
@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
@@ -31,17 +32,46 @@ jobs:
       - name: Build auditfix
         run: npm run build
 
+      # Capture stderr so a crash leaves a debuggable artifact. SARIF fallback
+      # remains so the upload step always has a valid file.
       - name: Run auditfix
+        id: scan
+        shell: bash
         run: |
-          node dist/index.js --sarif > auditfix-results.sarif 2>/dev/null || true
+          set -o pipefail
+          node dist/index.js --sarif > auditfix-results.sarif 2> auditfix-stderr.log
+          status=$?
+          echo "scan_exit=$status" >> "$GITHUB_OUTPUT"
+
           if [ ! -s auditfix-results.sarif ]; then
-            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"auditfix","version":"1.0.1","informationUri":"https://github.com/BFAlajid/auditfix"}},"results":[]}]}' > auditfix-results.sarif
+            echo "::warning::auditfix produced empty SARIF — writing fallback"
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"auditfix","version":"2.0.0","informationUri":"https://github.com/BFAlajid/auditfix"}},"results":[]}]}' > auditfix-results.sarif
           fi
 
+          # Non-zero from the scanner itself (2 = error) should fail the job;
+          # exit 1 (vulns found) is the normal signal and shouldn't tank CI.
+          if [ "$status" -ge 2 ]; then
+            exit "$status"
+          fi
+
+      # Upload SARIF to GitHub Code Scanning. No continue-on-error: if this
+      # fails, we want to know.
       - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
         if: always()
-        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: auditfix-results.sarif
           category: dependency-audit
+
+      # Preserve stderr when something went wrong so we can debug from the
+      # artifact tab without re-running.
+      - name: Upload scan stderr on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditfix-stderr
+          path: |
+            auditfix-stderr.log
+            auditfix-results.sarif
+          if-no-files-found: ignore
+          retention-days: 14

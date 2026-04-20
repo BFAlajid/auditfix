@@ -1,18 +1,30 @@
 name: CI
 
+# Default to read-only token; individual jobs escalate if they need more.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on the same PR/branch to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Test (${{ matrix.node-version }})
-    runs-on: ubuntu-latest
+    name: Test (node ${{ matrix.node-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
 
     strategy:
+      # Don't bail on the first failure — we want signal from every cell.
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: [18, 20, 22]
 
     steps:
@@ -21,12 +33,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          # Cache ~/.npm keyed by package-lock.json hash.
           cache: 'npm'
 
       - run: npm ci
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+      # Fail the PR if dist/ is out of sync with source. Prevents shipping
+      # an Action bundle that doesn't match the TypeScript.
+      - name: Verify dist/ is up to date
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain dist/)" ]; then
+            echo "::error::dist/ is out of date. Run 'npm run build' and commit the result."
+            git status --porcelain dist/
+            git --no-pager diff dist/ | head -200
+            exit 1
+          fi
 
   coverage:
     name: Coverage
@@ -39,10 +65,13 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
+      # Vitest enforces thresholds declared in vitest.config.ts; CI fails
+      # if coverage drops below them.
       - run: npm run test:coverage
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           file: coverage/lcov.info
-          fail_ci_if_error: false
-        continue-on-error: true
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

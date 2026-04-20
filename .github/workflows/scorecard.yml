@@ -1,0 +1,53 @@
+name: OSSF Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    # Weekly. Sunday 04:00 UTC.
+    - cron: '0 4 * * 0'
+  push:
+    branches: [main]
+
+# Scorecard needs write for security-events (SARIF upload), write for
+# id-token (branch-protection check via OIDC), and read for contents.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Required for private repos only; harmless for public. publish_results
+          # sends data to the scorecard public dataset. Set to false if the
+          # repo goes private.
+          publish_results: true
+
+      # Archive the raw SARIF so we can compare historical runs locally.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      # Surface findings in the Security tab.
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: scorecard

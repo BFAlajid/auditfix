@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # npm runtime + dev deps. Monday keeps the noise away from weekend releases.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - npm
+    # Keep the lock file + package.json updates grouped per package so the
+    # PR doesn't split a single upgrade into two reviews.
+    versioning-strategy: auto
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # Pin GitHub Actions versions in our workflows. Critical for SLSA-style
+  # supply-chain hygiene — unpinned refs are the #1 CI compromise vector.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: chore
+      include: scope
