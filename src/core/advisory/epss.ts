@@ -4,6 +4,7 @@
  * Also checks CISA KEV (Known Exploited Vulnerabilities) catalog.
  */
 import * as logger from '../../utils/logger.js';
+import { getPooledDispatcher } from '../../utils/fetch.js';
 
 export type EpssScore = {
   cve: string;
@@ -36,9 +37,13 @@ export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, Eps
     const batch = cveIds.slice(i, i + BATCH_SIZE);
     try {
       const param = batch.join(',');
+      const dispatcher = await getPooledDispatcher();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const init: any = { signal: AbortSignal.timeout(10_000) };
+      if (dispatcher) init.dispatcher = dispatcher;
       const response = await fetch(
         `https://api.first.org/data/v1/epss?cve=${param}`,
-        { signal: AbortSignal.timeout(10_000) },
+        init,
       );
       if (!response.ok) continue;
 
@@ -71,9 +76,13 @@ export async function fetchKevCatalog(): Promise<Set<string>> {
   }
 
   try {
+    const dispatcher = await getPooledDispatcher();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const init: any = { signal: AbortSignal.timeout(15_000) };
+    if (dispatcher) init.dispatcher = dispatcher;
     const response = await fetch(
       'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
-      { signal: AbortSignal.timeout(15_000) },
+      init,
     );
     if (!response.ok) {
       logger.debug(`CISA KEV fetch failed: HTTP ${response.status}`);
