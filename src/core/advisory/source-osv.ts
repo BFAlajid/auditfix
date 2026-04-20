@@ -15,7 +15,7 @@ import type {
   Advisory,
 } from '../../types/advisory.js';
 import { affectedToSemverRange, affectedFixVersion } from './osv-ranges.js';
-import { safeJsonParse } from '../../utils/sanitize.js';
+import { fetchJsonWithValidation } from '../../utils/fetch.js';
 import * as logger from '../../utils/logger.js';
 
 const OSV_BATCH_URL = 'https://api.osv.dev/v1/querybatch';
@@ -77,19 +77,22 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
     return response as OsvBatchResponse;
   };
 
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
-    const chunk = batches.slice(i, i + MAX_CONCURRENT_BATCHES);
-    const results = await Promise.allSettled(chunk.map((batch) => runBatch(batch)));
+    try {
+      const batchResponse = await fetchJsonWithValidation<OsvBatchResponse>(
+        OSV_BATCH_URL,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(query),
+        },
+        { maxSize: MAX_RESPONSE_SIZE, pool: true },
+      );
 
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        const batchResponse = result.value;
-        if (batchResponse.results) {
-          for (const r of batchResponse.results) {
-            if (r.vulns) {
-              for (const vuln of r.vulns) {
-                allVulnIds.add(vuln.id);
-              }
+      if (batchResponse.results) {
+        for (const result of batchResponse.results) {
+          if (result.vulns) {
+            for (const vuln of result.vulns) {
+              allVulnIds.add(vuln.id);
             }
           }
         }
@@ -173,41 +176,13 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
 
 async function fetchVulnDetail(id: string): Promise<OsvVulnerability | null> {
   try {
-    return await fetchWithValidation(
+    return await fetchJsonWithValidation<OsvVulnerability>(
       `${OSV_VULN_URL}/${encodeURIComponent(id)}`,
       { method: 'GET' },
-      MAX_INDIVIDUAL_SIZE,
-    ) as OsvVulnerability;
+      { maxSize: MAX_INDIVIDUAL_SIZE, pool: true },
+    );
   } catch (err) {
     logger.warn(`Failed to fetch OSV vuln ${id}: ${err instanceof Error ? err.message : err}`);
     return null;
   }
-}
-
-async function fetchWithValidation(url: string, init: RequestInit, maxSize: number): Promise<unknown> {
-  const response = await fetch(url, {
-    ...init,
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
-
-  const contentType = response.headers.get('content-type') ?? '';
-  if (!contentType.includes('application/json')) {
-    throw new Error(`Unexpected Content-Type: ${contentType}. Expected application/json.`);
-  }
-
-  const contentLength = response.headers.get('content-length');
-  if (contentLength && parseInt(contentLength, 10) > maxSize) {
-    throw new Error(`Response too large: ${contentLength} bytes (max ${maxSize})`);
-  }
-
-  const text = await response.text();
-  if (text.length > maxSize) {
-    throw new Error(`Response body too large: ${text.length} chars (max ${maxSize})`);
-  }
-
-  return safeJsonParse(text);
 }

@@ -4,7 +4,7 @@
  * Also checks CISA KEV (Known Exploited Vulnerabilities) catalog.
  */
 import * as logger from '../../utils/logger.js';
-import { fetchJsonWithValidation, FetchValidationError } from '../../utils/fetch.js';
+import { getPooledDispatcher } from '../../utils/fetch.js';
 
 export type EpssScore = {
   cve: string;
@@ -113,10 +113,21 @@ export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, Eps
   const results = new Map<string, EpssScore>();
   if (cveIds.length === 0) return results;
 
-  const batches: string[][] = [];
-  for (let i = 0; i < cveIds.length; i += EPSS_BATCH_SIZE) {
-    batches.push(cveIds.slice(i, i + EPSS_BATCH_SIZE));
-  }
+  // EPSS API supports comma-separated CVEs, batch in groups of 50
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < cveIds.length; i += BATCH_SIZE) {
+    const batch = cveIds.slice(i, i + BATCH_SIZE);
+    try {
+      const param = batch.join(',');
+      const dispatcher = await getPooledDispatcher();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const init: any = { signal: AbortSignal.timeout(10_000) };
+      if (dispatcher) init.dispatcher = dispatcher;
+      const response = await fetch(
+        `https://api.first.org/data/v1/epss?cve=${param}`,
+        init,
+      );
+      if (!response.ok) continue;
 
   const batchResults = await pMap(batches, fetchEpssBatch, EPSS_BATCH_CONCURRENCY);
 
@@ -143,13 +154,13 @@ export async function fetchKevCatalog(): Promise<Set<string>> {
   }
 
   try {
-    const data = await fetchJsonWithValidation<{ vulnerabilities?: Array<{ cveID: string }> }>(
+    const dispatcher = await getPooledDispatcher();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const init: any = { signal: AbortSignal.timeout(15_000) };
+    if (dispatcher) init.dispatcher = dispatcher;
+    const response = await fetch(
       'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
-      {
-        maxBytes: KEV_MAX_BYTES,
-        timeoutMs: KEV_TIMEOUT_MS,
-        contentType: 'application/json',
-      },
+      init,
     );
 
     const next = new Set((data.vulnerabilities ?? []).map((v) => v.cveID));

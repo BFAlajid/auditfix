@@ -9,6 +9,7 @@
 import type { DependencyGraph } from '../../types/package.js';
 import type { Advisory } from '../../types/advisory.js';
 import { safeJsonParse } from '../../utils/sanitize.js';
+import { getPooledDispatcher } from '../../utils/fetch.js';
 import * as logger from '../../utils/logger.js';
 import {
   defaultNpmrcConfig,
@@ -238,12 +239,16 @@ async function fetchOneBulk(
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    const dispatcher = await getPooledDispatcher();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const init: any = {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
-    });
+    };
+    if (dispatcher) init.dispatcher = dispatcher;
+    response = await fetch(NPM_BULK_URL, init);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`npm bulk request failed: ${msg}`);
