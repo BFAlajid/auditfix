@@ -62,6 +62,13 @@ async function uploadSarif(sarifContent: string, category: string): Promise<void
     return;
   }
 
+  // Basic token format validation
+  const validTokenPattern = /^(ghp_|ghs_|github_pat_|v\d+\.)[A-Za-z0-9_]+$/;
+  if (!validTokenPattern.test(token)) {
+    warning('GITHUB_TOKEN does not match expected GitHub token format');
+    return;
+  }
+
   try {
     const gzipped = gzipSync(Buffer.from(sarifContent));
     const encoded = gzipped.toString('base64');
@@ -81,7 +88,7 @@ async function uploadSarif(sarifContent: string, category: string): Promise<void
           ref,
           sarif: encoded,
           tool_name: 'auditfix',
-          checkout_uri: `file://${process.cwd()}`,
+          checkout_uri: `file:///github/workspace`,
         }),
         signal: AbortSignal.timeout(30_000),
       },
@@ -111,6 +118,23 @@ async function run(): Promise<void> {
     const jsonOutputPath = getInput('json-output');
     const webhookUrl = getInput('webhook-url');
     const sarifCategory = getInput('sarif-category') || 'auditfix';
+    const checkTyposquats = getBooleanInput('check-typosquats');
+    const checkProvenance = getBooleanInput('check-provenance');
+    const scanBehavior = getBooleanInput('scan-behavior');
+
+    // Validate severity input
+    const validSeverities = ['critical', 'high', 'medium', 'low', 'info'];
+    if (!validSeverities.includes(severity)) {
+      setFailed(`Invalid severity: ${severity}. Must be one of: ${validSeverities.join(', ')}`);
+      return;
+    }
+
+    // Validate fail-on input
+    const validFailOn = ['production-critical', 'production-high', 'any', 'none'];
+    if (!validFailOn.includes(failOn)) {
+      setFailed(`Invalid fail-on: ${failOn}. Must be one of: ${validFailOn.join(', ')}`);
+      return;
+    }
 
     // Run scan
     startGroup('Running auditfix scan');

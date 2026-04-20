@@ -85,6 +85,21 @@ function buildEffectiveIndex(gen: OfflineEntry[] | null): OfflineEntry[] {
 
 // Synchronous fallback used immediately; enriched lazily
 let BUILTIN_INDEX: OfflineEntry[] = HARDCODED_INDEX;
+// O1: Pre-indexed map for O(1) package name lookup instead of O(n) linear scan
+let INDEX_BY_NAME: Map<string, OfflineEntry[]> = buildNameIndex(HARDCODED_INDEX);
+
+function buildNameIndex(entries: OfflineEntry[]): Map<string, OfflineEntry[]> {
+  const map = new Map<string, OfflineEntry[]>();
+  for (const entry of entries) {
+    const list = map.get(entry.pkg);
+    if (list) {
+      list.push(entry);
+    } else {
+      map.set(entry.pkg, [entry]);
+    }
+  }
+  return map;
+}
 
 // Attempt to load generated index on first async call
 let indexReady: Promise<void> | null = null;
@@ -92,6 +107,7 @@ function ensureIndex(): Promise<void> {
   if (!indexReady) {
     indexReady = loadGeneratedIndex().then((gen) => {
       BUILTIN_INDEX = buildEffectiveIndex(gen);
+      INDEX_BY_NAME = buildNameIndex(BUILTIN_INDEX);
     });
   }
   return indexReady;
@@ -99,16 +115,17 @@ function ensureIndex(): Promise<void> {
 
 /**
  * Query the offline index for advisories affecting a specific package + version.
+ * Uses pre-built name index for O(1) lookup instead of scanning all entries.
  */
 export function queryOfflineIndex(
   packageName: string,
   version: string,
 ): Advisory[] {
   const results: Advisory[] = [];
+  const entries = INDEX_BY_NAME.get(packageName);
+  if (!entries) return results;
 
-  for (const entry of BUILTIN_INDEX) {
-    if (entry.pkg !== packageName) continue;
-
+  for (const entry of entries) {
     try {
       if (semver.satisfies(version, entry.range, { includePrerelease: true })) {
         results.push({

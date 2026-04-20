@@ -32,5 +32,5 @@ export type LockfileParseResult = {
 
 export type SkippedDependency = {
   key: string;
-  reason: 'local-file' | 'git-dep' | 'unparseable' | 'workspace';
+  reason: 'local-file' | 'git-dep' | 'unparseable' | 'workspace' | 'invalid-name';
 };

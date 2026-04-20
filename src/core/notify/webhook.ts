@@ -12,6 +12,27 @@ export type WebhookResult = {
 };
 
 /**
+ * Validate that a webhook URL is safe (no SSRF to internal networks).
+ */
+export function isValidWebhookUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    const hostname = parsed.hostname.toLowerCase();
+    // Block localhost, loopback, link-local, and metadata endpoints
+    if (['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'].includes(hostname)) return false;
+    if (hostname.startsWith('169.254.')) return false; // AWS/cloud metadata
+    if (hostname.startsWith('10.')) return false;
+    if (hostname.startsWith('172.') && parseInt(hostname.split('.')[1]) >= 16 && parseInt(hostname.split('.')[1]) <= 31) return false;
+    if (hostname.startsWith('192.168.')) return false;
+    if (hostname.endsWith('.internal') || hostname.endsWith('.local')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Send audit results to a webhook URL.
  * Supports Slack incoming webhooks (detects hooks.slack.com) and generic POST endpoints.
  */
@@ -20,6 +41,9 @@ export async function sendWebhook(
   report: AuditReport,
   projectName?: string,
 ): Promise<WebhookResult> {
+  if (!isValidWebhookUrl(webhookUrl)) {
+    return { success: false, error: 'Webhook URL rejected: internal/private network addresses are not allowed' };
+  }
   const platform = detectPlatform(webhookUrl);
   const body = platform === 'slack' ? buildSlackPayload(report, projectName)
     : platform === 'teams' ? buildTeamsPayload(report, projectName)
@@ -48,9 +72,15 @@ export async function sendWebhook(
 }
 
 export function detectPlatform(url: string): 'slack' | 'teams' | 'discord' | 'generic' {
-  if (url.includes('hooks.slack.com') || url.includes('hooks.slack-gov.com')) return 'slack';
-  if (url.includes('webhook.office.com') || url.includes('outlook.office.com')) return 'teams';
-  if (url.includes('discord.com/api/webhooks')) return 'discord';
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    if (hostname === 'hooks.slack.com' || hostname === 'hooks.slack-gov.com') return 'slack';
+    if (hostname.endsWith('.webhook.office.com') || hostname === 'webhook.office.com' ||
+        hostname.endsWith('.outlook.office.com') || hostname === 'outlook.office.com') return 'teams';
+    if (hostname === 'discord.com' || hostname === 'discordapp.com') return 'discord';
+  } catch {
+    // Invalid URL — fall through to generic
+  }
   return 'generic';
 }
 

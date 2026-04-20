@@ -7,7 +7,9 @@ import { existsSync, statSync } from 'node:fs';
 import type { AuditReport } from '../types/report.js';
 import { analyze } from '../core/analyzer.js';
 import { loadConfig } from '../core/config.js';
-import { renderTerminalReport, getExitCode, getExitCodeForStrategy } from './output/terminal.js';
+import { renderTerminalReport } from './output/terminal.js';
+import { resolveFinalExitCode } from '../core/exit-code.js';
+import { LOCKFILE_NAMES } from '../core/constants.js';
 import { renderJsonReport } from './output/json.js';
 import { renderSarifReport, renderSarifDiffReport } from './output/sarif.js';
 import { generateSbom } from './output/sbom.js';
@@ -37,6 +39,8 @@ import { readFileSync, watch as fsWatch } from 'node:fs';
 import * as path from 'node:path';
 import { join } from 'node:path';
 import { safeJsonParse } from '../utils/sanitize.js';
+import { readProjectName } from '../utils/package-name.js';
+import { createCoalescingRunner } from '../utils/coalesce-runner.js';
 import chalk from 'chalk';
 
 const VERSION = process.env.AUDITFIX_VERSION ?? '2.0.0';
@@ -93,16 +97,31 @@ program
       logger.error(`--dir path does not exist or is not a directory: ${options.dir}`);
       process.exit(2);
     }
+
+    // S4: In GitHub Actions, restrict --dir to within $GITHUB_WORKSPACE so
+    // a malicious workflow input cannot cause auditfix to scan outside the
+    // checked-out repository (e.g. /etc or a self-hosted runner's home dir).
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      const ws = process.env.GITHUB_WORKSPACE;
+      if (!ws) {
+        logger.error('GITHUB_ACTIONS=true but GITHUB_WORKSPACE is not set');
+        process.exit(2);
+      }
+      const resolvedWs = path.resolve(ws);
+      if (dir !== resolvedWs && !dir.startsWith(resolvedWs + path.sep)) {
+        logger.error(`--dir (${dir}) must be within GITHUB_WORKSPACE (${resolvedWs})`);
+        process.exit(2);
+      }
+    }
+
     options.dir = dir;
 
     // --watch mode: watch lockfiles and re-scan
     if (options.watch) {
       console.log(chalk.bold('Watch mode: monitoring lockfiles for changes...'));
-      const lockfiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'];
-      let scanning = false;
-      const runScan = async () => {
-        if (scanning) return;
-        scanning = true;
+      // C-B2 fix: if changes arrive while a scan is in flight, coalesce them
+      // into a single trailing rescan instead of silently dropping them.
+      const runScan = createCoalescingRunner(async () => {
         console.log(chalk.dim(`\n[${new Date().toLocaleTimeString()}] Lockfile changed, re-scanning...`));
         try {
           const config = await loadConfig({}, options.dir);
@@ -116,15 +135,16 @@ program
           const msg = err instanceof Error ? err.message : String(err);
           logger.error(msg);
         }
-        scanning = false;
-      };
+      });
       // Initial scan
       await runScan();
       // Watch for changes
-      for (const lockfile of lockfiles) {
+      for (const lockfile of LOCKFILE_NAMES) {
         const lockPath = join(options.dir, lockfile);
         if (existsSync(lockPath)) {
-          fsWatch(lockPath, { persistent: true }, () => { runScan(); });
+          fsWatch(lockPath, { persistent: true }, () => {
+            runScan().catch(err => logger.error(`Watch scan failed: ${err instanceof Error ? err.message : err}`));
+          });
           logger.info(`Watching ${lockfile}`);
         }
       }
@@ -136,12 +156,7 @@ program
       // --sbom: generate CycloneDX SBOM and exit (no audit needed)
       if (options.sbom) {
         const lockfileResult = detectAndParseLockfile(options.dir);
-        let projectName: string | undefined;
-        try {
-          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
-          projectName = pkg.name;
-        } catch { /* optional */ }
-        console.log(generateSbom(lockfileResult.graph, VERSION, projectName));
+        console.log(generateSbom(lockfileResult.graph, VERSION, readProjectName(options.dir)));
         process.exit(0);
       }
 
@@ -178,6 +193,11 @@ program
       if (outputFormat === 'sarif') {
         if (options.sarifBaseline) {
           const baselinePath = path.resolve(options.sarifBaseline);
+          // S5: Restrict baseline file to project directory to prevent arbitrary file reads
+          if (!baselinePath.startsWith(dir + path.sep) && baselinePath !== dir) {
+            logger.error('SARIF baseline file must be within the project directory');
+            process.exit(2);
+          }
           try {
             const baselineJson = readFileSync(baselinePath, 'utf-8');
             const baseline = safeJsonParse<AuditReport>(baselineJson);
@@ -195,10 +215,15 @@ program
         console.log(renderTerminalReport(report, VERSION));
       }
 
+      // Parse lockfile once for all scanner features (avoids N+1 I/O)
+      const scannerLockfile = (options.scanScripts || options.checkLicenses || options.checkDepsAge ||
+        options.checkTyposquats || options.checkProvenance || options.scanBehavior)
+        ? detectAndParseLockfile(options.dir)
+        : null;
+
       // Scan install scripts if requested
-      if (options.scanScripts) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
-        const findings = scanInstallScripts(lockfileResult.graph, options.dir);
+      if (options.scanScripts && scannerLockfile) {
+        const findings = scanInstallScripts(scannerLockfile.graph, options.dir);
         if (findings.length > 0) {
           console.log('');
           console.log(chalk.bold.yellow(`⚠ ${findings.length} suspicious install scripts detected:`));
@@ -213,9 +238,8 @@ program
       }
 
       // Check licenses if requested
-      if (options.checkLicenses) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
-        const licenseFindings = scanLicenses(lockfileResult.graph, options.dir);
+      if (options.checkLicenses && scannerLockfile) {
+        const licenseFindings = scanLicenses(scannerLockfile.graph, options.dir);
         if (licenseFindings.length > 0) {
           console.log('');
           console.log(chalk.bold.yellow(`⚠ ${licenseFindings.length} license concerns detected:`));
@@ -232,11 +256,10 @@ program
       }
 
       // Check dependency age if requested
-      if (options.checkDepsAge) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
+      if (options.checkDepsAge && scannerLockfile) {
         console.log('');
         console.log(chalk.bold('Checking dependency freshness...'));
-        const ageFindings = await checkDepAge(lockfileResult.graph);
+        const ageFindings = await checkDepAge(scannerLockfile.graph);
         if (ageFindings.length > 0) {
           console.log(chalk.yellow(`${ageFindings.length} packages with no updates in 2+ years:`));
           for (const f of ageFindings) {
@@ -249,9 +272,8 @@ program
       }
 
       // Check typosquats if requested
-      if (options.checkTyposquats) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
-        const typosquatFindings = detectTyposquats(lockfileResult.graph);
+      if (options.checkTyposquats && scannerLockfile) {
+        const typosquatFindings = detectTyposquats(scannerLockfile.graph);
         if (typosquatFindings.length > 0) {
           console.log('');
           console.log(chalk.bold.red(`⚠ ${typosquatFindings.length} potential typosquat packages detected:`));
@@ -266,11 +288,10 @@ program
       }
 
       // Check provenance if requested
-      if (options.checkProvenance) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
+      if (options.checkProvenance && scannerLockfile) {
         console.log('');
         console.log(chalk.bold('Checking package provenance attestations...'));
-        const provReport = await checkProvenance(lockfileResult.graph);
+        const provReport = await checkProvenance(scannerLockfile.graph);
         console.log(`  Verified: ${chalk.green(String(provReport.verified))} | Unverified: ${chalk.yellow(String(provReport.unverified))}`);
         const unverifiedProd = provReport.findings.filter(f => !f.hasProvenance && f.isProduction);
         if (unverifiedProd.length > 0) {
@@ -285,11 +306,10 @@ program
       }
 
       // Scan behavior if requested
-      if (options.scanBehavior) {
-        const lockfileResult = detectAndParseLockfile(options.dir);
+      if (options.scanBehavior && scannerLockfile) {
         console.log('');
         console.log(chalk.bold('Scanning package source for suspicious behavior...'));
-        const behaviorFindings = scanBehavior(lockfileResult.graph, options.dir);
+        const behaviorFindings = scanBehavior(scannerLockfile.graph, options.dir);
         if (behaviorFindings.length > 0) {
           const critCount = behaviorFindings.filter(f => f.riskLevel === 'critical').length;
           const highCount = behaviorFindings.filter(f => f.riskLevel === 'high').length;
@@ -310,24 +330,14 @@ program
 
       // Generate VEX document if requested
       if (options.vex) {
-        let projectName: string | undefined;
-        try {
-          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
-          projectName = pkg.name;
-        } catch { /* optional */ }
-        const vexDoc = generateVex(report, VERSION, projectName);
+        const vexDoc = generateVex(report, VERSION, readProjectName(options.dir));
         console.log('');
         console.log(vexDoc);
       }
 
       // Send webhook notification if URL provided
       if (options.webhook) {
-        let projectName: string | undefined;
-        try {
-          const pkg = safeJsonParse<Record<string, string>>(readFileSync(join(options.dir, 'package.json'), 'utf-8'));
-          projectName = pkg.name;
-        } catch { /* optional */ }
-        const webhookResult = await sendWebhook(options.webhook, report, projectName);
+        const webhookResult = await sendWebhook(options.webhook, report, readProjectName(options.dir));
         if (!webhookResult.success) {
           logger.warn(`Webhook notification failed: ${webhookResult.error}`);
         }
@@ -344,6 +354,13 @@ program
       }
 
       // Evaluate policy if present
+      //
+      // H (correctness) fix: a policy failure here used to short-circuit with
+      // `process.exit(1)`, which silently bypassed the --fail-on strategy below.
+      // We now capture the result and merge both signals into one final exit
+      // code via resolveFinalExitCode(). Policy evaluation *errors* (not
+      // failures) still exit 2 immediately — they indicate tool error.
+      let policyFailed = false;
       if (options.policy !== false) {
         try {
           const policyPath = typeof options.policy === 'string' ? options.policy : undefined;
@@ -357,6 +374,7 @@ program
               for (const v of policyResult.violations) {
                 console.log(chalk.red(`  FAIL  ${v.finding.package}@${v.finding.version} — ${v.rule.name}`));
               }
+              policyFailed = true;
             }
             if (policyResult.warnings.length > 0) {
               console.log('');
@@ -364,9 +382,6 @@ program
               for (const w of policyResult.warnings) {
                 console.log(chalk.yellow(`  WARN  ${w.finding.package}@${w.finding.version} — ${w.rule.name}`));
               }
-            }
-            if (!policyResult.passed) {
-              process.exit(1);
             }
           }
         } catch (err) {
@@ -411,9 +426,11 @@ program
         }
       }
 
-      const exitCode = options.failOn
-        ? getExitCodeForStrategy(report, options.failOn)
-        : getExitCode(report);
+      const exitCode = resolveFinalExitCode({
+        report,
+        failOnStrategy: options.failOn,
+        policyFailed,
+      });
       process.exit(exitCode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -454,18 +471,6 @@ program
     });
 
     console.log(`Added ${advisoryId} (${options.package}) to .auditfixignore — expires ${options.expires}`);
-  });
-
-program
-  .command('update-index')
-  .description('Update the bundled offline advisory index from OSV.dev (requires network)')
-  .action(async () => {
-    console.log('The offline advisory index is bundled at build time.');
-    console.log('To get the latest advisories, update auditfix:');
-    console.log('  npm install -g auditfix@latest');
-    console.log('');
-    console.log('The index is a last-resort fallback. For real-time data, auditfix');
-    console.log('queries OSV.dev API directly (Tier 1) on every scan.');
   });
 
 program

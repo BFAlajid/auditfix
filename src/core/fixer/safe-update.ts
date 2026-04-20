@@ -8,6 +8,7 @@
 import type { ScoredVulnerability } from '../../types/report.js';
 import type { DependencyGraph } from '../../types/package.js';
 import { satisfies } from '../../utils/semver.js';
+import semver from 'semver';
 import * as logger from '../../utils/logger.js';
 
 export type FixPlan = {
@@ -116,8 +117,10 @@ export function planFixes(
 
     // For transitive deps, we use npm overrides to force the version.
     // This is safe for patch/minor bumps within the same major.
-    const currentMajor = vuln.match.installedVersion.split('.')[0];
-    const fixMajor = fixVersion.split('.')[0];
+    const currentParsed = semver.major(vuln.match.installedVersion);
+    const fixParsed = semver.major(fixVersion);
+    const currentMajor = currentParsed !== undefined ? String(currentParsed) : vuln.match.installedVersion.split('.')[0];
+    const fixMajor = fixParsed !== undefined ? String(fixParsed) : fixVersion.split('.')[0];
 
     if (currentMajor === fixMajor) {
       safe.push({

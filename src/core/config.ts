@@ -75,6 +75,20 @@ export async function loadConfig(
     logger.warn(`Failed to load config file: ${message} — using defaults`);
   }
 
+  // F1: Environment variable overrides (between file config and CLI overrides)
+  const envConfig: Partial<AuditfixConfig> = {};
+  const validSeverities = ['critical', 'high', 'medium', 'low', 'info'] as const;
+  const envSeverity = process.env.AUDITFIX_SEVERITY;
+  if (envSeverity && validSeverities.includes(envSeverity as typeof validSeverities[number])) {
+    envConfig.severity = envSeverity as AuditfixConfig['severity'];
+  }
+  if (process.env.AUDITFIX_PROD_ONLY === 'true') envConfig.productionOnly = true;
+  const validOutputs = ['terminal', 'json', 'sarif'] as const;
+  const envOutput = process.env.AUDITFIX_OUTPUT;
+  if (envOutput && validOutputs.includes(envOutput as typeof validOutputs[number])) {
+    envConfig.output = envOutput as AuditfixConfig['output'];
+  }
+
   // Strip undefined keys from CLI overrides so they don't clobber file/default values
   const cleanOverrides = stripUndefined(cliOverrides);
 
@@ -86,9 +100,11 @@ export async function loadConfig(
   };
 
   // Shallow merge for top-level, then assign deep-merged ci
+  // Merge order: defaults → file config → env vars → CLI overrides
   const merged: AuditfixConfig = {
     ...DEFAULT_CONFIG,
     ...fileConfig,
+    ...envConfig,
     ...cleanOverrides,
     ci: mergedCi,
   };

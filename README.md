@@ -188,6 +188,128 @@ auditfix diff baseline.json current.json
 
 Output shows new vulnerabilities (red), fixed vulnerabilities (green), and unchanged. Exits 1 if regressions are found — useful for CI PR gating.
 
+## Policy Engine
+
+The policy engine lets you codify your security requirements as YAML rules. auditfix evaluates every finding against your policy and reports violations, warnings, and auto-ignored items.
+
+### Creating a policy file
+
+Create `.auditfix-policy.yml` (or `.auditfix-policy.yaml`) in your project root:
+
+```yaml
+version: 1
+
+rules:
+  - name: block-critical-prod
+    description: Fail on critical production vulnerabilities
+    match:
+      all:
+        - severity: [critical]
+        - scope: production
+    action: fail
+
+  - name: warn-high-with-exploit
+    description: Warn on high-severity vulns with active exploits
+    match:
+      all:
+        - severity: [high]
+        - scope: production
+      any:
+        - epss: { gte: 0.5 }
+        - kev: true
+    action: warn
+
+  - name: ignore-dev-low
+    description: Auto-suppress low-severity dev-only findings
+    match:
+      all:
+        - severity: [low, info]
+        - scope: dev
+    action: auto-ignore
+    reason: Dev-only low-severity findings are acceptable risk
+
+overrides:
+  - rule: block-critical-prod
+    action: warn
+    reason: "Temporary exception for migration sprint"
+    expires: "2026-06-30"
+    approved-by: security-team
+```
+
+### YAML format
+
+A policy file requires:
+
+- **`version`** — Must be `1`.
+- **`rules`** — An array of rule objects. Each rule has:
+  - `name` (required) — Kebab-case identifier (e.g., `block-critical-prod`).
+  - `description` (optional) — Human-readable description.
+  - `match` (required) — Condition block with `all` (AND) and/or `any` (OR) arrays.
+  - `action` (required) — One of `fail`, `warn`, `notify`, `auto-ignore`.
+  - `reason` (required for `auto-ignore`) — Justification for suppression.
+  - `message` (optional) — Custom message for violations.
+- **`overrides`** (optional) — Temporarily change a rule's action.
+- **`extends`** (optional) — Array of relative paths to inherit rules from other policy files (max depth 3).
+- **`settings`** (optional) — Configure which scans the policy enables (e.g., `enable-scans: [licenses, typosquats, provenance, behavior, dep-age]`).
+
+### Match conditions
+
+Conditions are placed inside `all` (every condition must match) and `any` (at least one must match) blocks:
+
+| Condition | Type | Description |
+|-----------|------|-------------|
+| `severity` | `string[]` | Match severity levels: `critical`, `high`, `medium`, `low`, `info` |
+| `scope` | `string` | Match dependency scope: `production` or `dev` |
+| `epss` | `numeric` | EPSS exploit probability (0.0-1.0). Supports `gt`, `gte`, `lt`, `lte`, `eq` |
+| `kev` | `boolean` | Whether the vulnerability is in the CISA KEV catalog |
+| `fix-available` | `boolean` | Whether a fix version exists |
+| `package` | `string[]` | Package name patterns (supports `*` glob, e.g., `@types/*`) |
+| `depth` | `numeric` | Dependency tree depth. Supports `gt`, `gte`, `lt`, `lte`, `eq` |
+| `direct-dep` | `boolean` | Whether the package is a direct dependency |
+| `license` | `string[]` | License identifiers (e.g., `GPL-3.0`, `AGPL-3.0`) |
+| `provenance` | `boolean` | Whether the package has Sigstore provenance attestation |
+| `behavior` | `string[]` | Behavioral patterns detected (e.g., `eval`, `http-request`, `env-access`). All listed behaviors must be present. |
+| `dep-age` | `numeric` | Months since last publish. Supports `gt`, `gte`, `lt`, `lte`, `eq` |
+| `typosquat` | `boolean` | Whether the package is flagged as a potential typosquat |
+
+### Actions
+
+| Action | Effect |
+|--------|--------|
+| `fail` | Marks the finding as a violation. Causes a non-zero exit code. |
+| `warn` | Records a warning but does not fail the scan. |
+| `notify` | Same as warn; intended for webhook/notification integrations. |
+| `auto-ignore` | Suppresses the finding (requires `reason` field). |
+
+The first matching rule wins for each finding. Rule order matters.
+
+### Overrides
+
+Overrides temporarily change a rule's action without editing the rule itself:
+
+```yaml
+overrides:
+  - rule: block-critical-prod     # must match a rule name
+    action: warn                   # new action
+    reason: "Sprint exception"     # required justification
+    expires: "2026-06-30"          # optional expiry date (ISO 8601)
+    approved-by: security-team     # optional audit trail
+```
+
+Expired overrides are automatically ignored and the original action is restored.
+
+### CLI flags
+
+```bash
+# Use a specific policy file
+auditfix --policy path/to/policy.yml
+
+# Skip policy evaluation entirely
+auditfix --no-policy
+```
+
+When no `--policy` flag is provided, auditfix auto-detects `.auditfix-policy.yml` or `.auditfix-policy.yaml` in the project root.
+
 ## CI Exit Code Strategies
 
 Control when auditfix fails your CI pipeline:
@@ -319,17 +441,56 @@ Watches `package-lock.json`, `yarn.lock`, and `pnpm-lock.yaml` in the project di
 
 ## Webhook Notifications
 
-Send scan results to Slack or any HTTP endpoint:
+Send scan results to Slack, Microsoft Teams, Discord, or any HTTP endpoint:
 
 ```bash
 # Slack incoming webhook
 auditfix --webhook https://hooks.slack.com/services/T00/B00/xxx
 
+# Microsoft Teams incoming webhook
+auditfix --webhook https://outlook.office.com/webhook/...
+
+# Discord webhook
+auditfix --webhook https://discord.com/api/webhooks/...
+
 # Generic webhook (receives JSON payload)
 auditfix --webhook https://your-server.com/audit-hook
 ```
 
-Slack messages include severity counts, top 5 vulnerabilities, and confidence level.
+The webhook platform is auto-detected from the URL:
+
+| URL pattern | Platform | Payload format |
+|-------------|----------|----------------|
+| `hooks.slack.com` | Slack | Block Kit with header, severity counts, top 5 vulns |
+| `webhook.office.com` / `outlook.office.com` | Teams | MessageCard with severity facts and optional GitHub link |
+| `discord.com/api/webhooks` | Discord | Rich embed with color-coded severity and top 5 vuln fields |
+| Any other URL | Generic | JSON object with `event`, `summary`, and `vulnerabilities` arrays |
+
+## PR Comment Bot
+
+Post scan results directly as a GitHub PR comment:
+
+```bash
+auditfix --pr-comment
+```
+
+Requires `GITHUB_TOKEN` (automatically available in GitHub Actions). The comment includes:
+
+- Severity summary table (critical, high, medium, low counts)
+- Top 10 vulnerabilities with package, version, severity, score, and fix version
+- Auto-fix suggestions listing upgradeable packages
+- Scan metadata footer (advisory source, packages scanned, confidence, duration)
+
+The bot auto-detects the PR number from the GitHub Actions environment (`GITHUB_REF` or `GITHUB_EVENT_PATH`). On subsequent runs, it updates the existing comment in-place rather than creating duplicates.
+
+### GitHub Actions example
+
+```yaml
+- name: Audit and comment
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: npx auditfix --pr-comment
+```
 
 ## Output Formats
 
@@ -348,6 +509,20 @@ SARIF v2.1.0 output for GitHub Code Scanning integration:
 ```bash
 auditfix --sarif > results.sarif
 ```
+
+### SARIF Diff Mode (`--sarif-baseline`)
+
+When used with `--sarif`, the `--sarif-baseline` flag compares the current scan against a previous JSON report and outputs only **new** vulnerabilities not present in the baseline. This is useful for PR gating where you only want to flag regressions:
+
+```bash
+# Save a baseline report
+auditfix --json > baseline.json
+
+# On the next scan, output SARIF containing only new findings
+auditfix --sarif --sarif-baseline baseline.json > diff.sarif
+```
+
+Only vulnerabilities not present in the baseline are included in the SARIF output. Combine with GitHub Code Scanning to surface only newly introduced issues.
 
 ### CycloneDX SBOM (`--sbom`)
 
@@ -449,6 +624,63 @@ Create `.auditfixrc.json` or `.auditfixrc.yaml` in your project root:
 Supports: `.auditfixrc`, `.auditfixrc.json`, `.auditfixrc.yml`, `.auditfixrc.yaml`, and `package.json` (`auditfix` key).
 
 CLI flags override config file values.
+
+## Configuration Reference
+
+Complete reference of all configuration fields. Set these in your config file (e.g., `.auditfixrc.json`) or via CLI flags.
+
+| Field | Type | Default | CLI flag | Description |
+|-------|------|---------|----------|-------------|
+| `severity` | `"critical"` \| `"high"` \| `"medium"` \| `"low"` \| `"info"` | `"low"` | `--severity <level>` | Minimum severity threshold. Vulnerabilities below this level are excluded from results. |
+| `productionOnly` | `boolean` | `false` | `--prod-only` | Only report vulnerabilities in production dependencies. Dev-only findings are excluded. |
+| `autoFix` | `boolean` | `false` | `--fix` | Automatically apply safe (non-breaking) version updates via lockfile overrides. |
+| `ignoreDev` | `boolean` | `false` | — | Ignore all dev dependencies during scanning. Similar to `productionOnly` but applied earlier in the pipeline. |
+| `communityAllowList` | `boolean` | `false` | — | Enable community-maintained allow-list of known false positives. |
+| `maxAdvisoryStaleness` | `string` | `"7d"` | — | Maximum age of cached advisory data before re-fetching. Duration string (e.g., `"4h"`, `"7d"`, `"24h"`). |
+| `output` | `"terminal"` \| `"json"` \| `"sarif"` | `"terminal"` | `--json` / `--sarif` | Output format. `--ci` forces `json`. |
+| `ci.failOn` | `"production-critical"` \| `"production-high"` \| `"any"` | `"production-critical"` | `--fail-on <strategy>` | CI exit code strategy. Controls which findings cause a non-zero exit. |
+| `ci.sarifUpload` | `boolean` | `false` | `--sarif` | Enable SARIF output in CI mode for GitHub Code Scanning integration. |
+
+### Example config file
+
+```json
+{
+  "severity": "high",
+  "productionOnly": true,
+  "autoFix": false,
+  "ignoreDev": false,
+  "communityAllowList": false,
+  "maxAdvisoryStaleness": "4h",
+  "output": "terminal",
+  "ci": {
+    "failOn": "production-high",
+    "sarifUpload": true
+  }
+}
+```
+
+### YAML equivalent
+
+```yaml
+severity: high
+productionOnly: true
+autoFix: false
+maxAdvisoryStaleness: 4h
+output: terminal
+ci:
+  failOn: production-high
+  sarifUpload: true
+```
+
+### Merge order
+
+Configuration is resolved in the following precedence (highest wins):
+
+1. CLI flags
+2. Config file (`.auditfixrc.json`, `.auditfixrc.yml`, etc.)
+3. Built-in defaults
+
+The `ci` object is deep-merged: you can set `ci.failOn` in the config file and `ci.sarifUpload` via CLI without one overwriting the other.
 
 ## How It Works
 

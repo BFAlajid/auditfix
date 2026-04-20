@@ -1,11 +1,19 @@
-import { describe, it, expect } from 'vitest';
-import { scanImportChains, isDirectlyImported } from '../../src/core/graph/import-chain.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+import {
+  scanImportChains,
+  isDirectlyImported,
+  clearImportChainCache,
+} from '../../src/core/graph/import-chain.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
 describe('Import chain scanner', () => {
   let tmpDir: string;
+
+  beforeEach(() => {
+    clearImportChainCache();
+  });
 
   function setup(files: Record<string, string>) {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'auditfix-import-'));
@@ -205,5 +213,100 @@ describe('Import chain scanner', () => {
     const packages = new Set(['express', 'lodash']);
     expect(isDirectlyImported('express', packages)).toBe(true);
     expect(isDirectlyImported('axios', packages)).toBe(false);
+  });
+
+  it('stripComments preserves // and /* inside string and template literals', () => {
+    setup({
+      'src/index.ts': [
+        `const a = "https://example.com/path";`,
+        `const b = '/* not a comment */';`,
+        `const c = \`url: // still not a comment\`;`,
+        `import real from 'real-pkg';`,
+      ].join('\n'),
+    });
+    const result = scanImportChains(tmpDir);
+    cleanup();
+
+    expect(result.has('real-pkg')).toBe(true);
+  });
+
+  it('parses JSX/TSX imports', () => {
+    setup({
+      'src/App.tsx': [
+        `import React from 'react';`,
+        `import { Button } from '@ui/components';`,
+        `export default function App() { return <Button/>; }`,
+      ].join('\n'),
+    });
+    const result = scanImportChains(tmpDir);
+    cleanup();
+
+    expect(result.has('react')).toBe(true);
+    expect(result.has('@ui/components')).toBe(true);
+  });
+
+  it('detects dynamic import(expr) with all quote styles', () => {
+    setup({
+      'src/dyn.ts': [
+        `const a = await import('single-q');`,
+        `const b = await import("double-q");`,
+        `const c = await import(\`tmpl-q\`);`,
+      ].join('\n'),
+    });
+    const result = scanImportChains(tmpDir);
+    cleanup();
+
+    expect(result.has('single-q')).toBe(true);
+    expect(result.has('double-q')).toBe(true);
+    expect(result.has('tmpl-q')).toBe(true);
+  });
+
+  it('mtime memoization: second call with unchanged mtime returns cached parse', () => {
+    setup({
+      'src/index.ts': `import express from 'express';`,
+    });
+
+    // Pin the file's mtime to a whole-second timestamp so utimesSync
+    // round-trips cleanly through statSync (sub-ms precision loss otherwise).
+    const filePath = path.join(tmpDir, 'src/index.ts');
+    const pinned = new Date(Math.floor(Date.now() / 1000) * 1000 - 10_000);
+    fs.utimesSync(filePath, pinned, pinned);
+
+    // First pass warms the cache.
+    const first = scanImportChains(tmpDir);
+    expect(first.has('express')).toBe(true);
+
+    // Mutate file contents, then re-pin the same mtime. If the cache is
+    // honored, the scanner returns the cached parse ('express') rather than
+    // the new content ('different-pkg').
+    fs.writeFileSync(filePath, `import different from 'different-pkg';`);
+    fs.utimesSync(filePath, pinned, pinned);
+
+    const second = scanImportChains(tmpDir);
+    cleanup();
+
+    expect(second.has('express')).toBe(true);
+    expect(second.has('different-pkg')).toBe(false);
+  });
+
+  it('mtime memoization: updated mtime invalidates cache', () => {
+    setup({
+      'src/index.ts': `import express from 'express';`,
+    });
+
+    const first = scanImportChains(tmpDir);
+    expect(first.has('express')).toBe(true);
+
+    const filePath = path.join(tmpDir, 'src/index.ts');
+    fs.writeFileSync(filePath, `import lodash from 'lodash';`);
+    // Bump mtime to some future time to guarantee cache miss.
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(filePath, future, future);
+
+    const second = scanImportChains(tmpDir);
+    cleanup();
+
+    expect(second.has('lodash')).toBe(true);
+    expect(second.has('express')).toBe(false);
   });
 });

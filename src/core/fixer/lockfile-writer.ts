@@ -107,6 +107,14 @@ export async function applyFixes(
   const existingOverrides = strategy.getExisting(packageJson);
   strategy.setOverrides(packageJson, { ...existingOverrides, ...overrides });
 
+  // S8: Re-check symlink immediately before write to mitigate TOCTOU
+  try {
+    if (lstatSync(packageJsonPath).isSymbolicLink()) {
+      failed.push({ packageName: '*', reason: 'Refusing to write to symlinked package.json (detected at write time)' });
+      return { applied, failed };
+    }
+  } catch { /* file removed between reads — writeFileSync will fail below */ }
+
   try {
     writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf-8');
     logger.debug(`Wrote ${Object.keys(overrides).length} overrides to package.json (${strategy.name})`);

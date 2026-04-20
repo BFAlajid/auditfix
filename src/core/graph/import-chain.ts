@@ -7,7 +7,7 @@
  * definitively prove unreachability (dynamic requires, conditional imports).
  */
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { join, extname, resolve, dirname } from 'node:path';
+import { join, extname, resolve } from 'node:path';
 import * as logger from '../../utils/logger.js';
 
 const JS_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx']);
@@ -29,85 +29,84 @@ const NODE_BUILTINS = new Set([
   'worker_threads', 'zlib',
 ]);
 
-const IMPORT_PATTERNS = [
-  // ES import: import x from 'pkg', import { x } from 'pkg', import 'pkg'
-  /(?:import\s+(?:[\w{},*\s]+\s+from\s+)?['"])([^'"./][^'"]*)['"]/g,
-  // require: require('pkg'), require("pkg")
-  /require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)/g,
-  // dynamic import: import('pkg'), import("pkg"), import(`pkg`)
-  /import\s*\(\s*['"`]([^'"`./][^'"`]*?)['"`]\s*\)/g,
-  // re-export: export { foo } from 'pkg', export * from 'pkg'
-  /export\s+(?:[\w{},*\s]+\s+from\s+)['"]([^'"./][^'"]*)['"]/g,
-];
+/**
+ * Single combined pattern for all bare-specifier import forms.
+ * Alternation branches (ordered by expected frequency):
+ *   1. `import … from 'pkg'` | `import 'pkg'`
+ *   2. `export … from 'pkg'`
+ *   3. `require('pkg')`
+ *   4. dynamic `import('pkg')` | `import(\`pkg\`)`
+ *
+ * Bare specifiers only (first char is not `.` and not `/`).
+ * The specifier is captured by whichever group fires; we scan all four.
+ */
+const IMPORT_PATTERN =
+  /(?:import\s+(?:[\w{},*\s]+\s+from\s+)?['"]([^'"./][^'"]*)['"])|(?:export\s+(?:[\w{},*\s]+\s+from\s+)['"]([^'"./][^'"]*)['"])|(?:require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\))|(?:import\s*\(\s*['"`]([^'"`./][^'"`]*?)['"`]\s*\))/g;
 
 /**
- * Strip single-line (//) and multi-line comments from source code.
- * Respects string literals so that URLs or comment-like text inside strings
- * are preserved. Uses a character-by-character scan (lightweight AST approach).
+ * Strip single-line (//) and multi-line (/* ... *\/) comments from source.
+ * String literals and template literals are preserved so that URLs or
+ * comment-like text inside strings don't get stripped.
+ *
+ * Single-pass state machine over the source string using index-scanning
+ * (avoids the per-character array-push + join from the previous version).
  */
 function stripComments(source: string): string {
-  const result: string[] = [];
-  let i = 0;
   const len = source.length;
+  let out = '';
+  let i = 0;
+  let segStart = 0;
 
   while (i < len) {
-    const ch = source[i];
-    const next = i + 1 < len ? source[i + 1] : '';
+    const ch = source.charCodeAt(i);
 
-    // Single-line comment
-    if (ch === '/' && next === '/') {
-      // Skip until end of line
-      i += 2;
-      while (i < len && source[i] !== '\n') i++;
-      // Keep the newline to preserve line structure
-      continue;
-    }
-
-    // Multi-line comment
-    if (ch === '/' && next === '*') {
-      i += 2;
-      while (i < len) {
-        if (source[i] === '*' && i + 1 < len && source[i + 1] === '/') {
-          i += 2;
-          break;
-        }
-        i++;
+    // '/' — could start a comment
+    if (ch === 47 /* / */ && i + 1 < len) {
+      const next = source.charCodeAt(i + 1);
+      if (next === 47 /* // */) {
+        // Flush pre-comment text, then skip until newline.
+        out += source.slice(segStart, i);
+        i += 2;
+        while (i < len && source.charCodeAt(i) !== 10 /* \n */) i++;
+        segStart = i; // keep the newline
+        continue;
       }
-      // Replace with space to avoid merging tokens
-      result.push(' ');
-      continue;
+      if (next === 42 /* * */) {
+        // Flush, then skip to */ and inject a single space.
+        out += source.slice(segStart, i);
+        i += 2;
+        while (i + 1 < len) {
+          if (source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47) {
+            i += 2;
+            break;
+          }
+          i++;
+        }
+        if (i + 1 >= len) i = len;
+        out += ' ';
+        segStart = i;
+        continue;
+      }
     }
 
-    // String literals — skip their contents to avoid stripping comment-like
-    // sequences inside strings
-    if (ch === '"' || ch === "'" || ch === '`') {
+    // String / template literal — skip to matching close, respecting escapes.
+    if (ch === 34 /* " */ || ch === 39 /* ' */ || ch === 96 /* ` */) {
       const quote = ch;
-      result.push(ch);
       i++;
       while (i < len) {
-        const sc = source[i];
-        if (sc === '\\') {
-          // Escaped character — push both and skip
-          result.push(sc);
-          i++;
-          if (i < len) {
-            result.push(source[i]);
-            i++;
-          }
-          continue;
-        }
-        result.push(sc);
+        const sc = source.charCodeAt(i);
+        if (sc === 92 /* \ */) { i += 2; continue; }
+        if (sc === quote) { i++; break; }
         i++;
-        if (sc === quote) break;
       }
       continue;
     }
 
-    result.push(ch);
     i++;
   }
 
-  return result.join('');
+  out += source.slice(segStart, len);
+  return out;
 }
 
 /**
@@ -115,7 +114,6 @@ function stripComments(source: string): string {
  */
 function isNodeBuiltin(specifier: string): boolean {
   if (specifier.startsWith('node:')) return true;
-  // Check the base module name (e.g., 'fs' from 'fs/promises')
   return NODE_BUILTINS.has(specifier);
 }
 
@@ -126,44 +124,48 @@ function isNodeBuiltin(specifier: string): boolean {
  */
 function extractPackageName(specifier: string): string {
   if (specifier.startsWith('@')) {
-    return specifier.split('/').slice(0, 2).join('/');
+    const first = specifier.indexOf('/');
+    if (first < 0) return specifier;
+    const second = specifier.indexOf('/', first + 1);
+    return second < 0 ? specifier : specifier.slice(0, second);
   }
-  return specifier.split('/')[0];
+  const slash = specifier.indexOf('/');
+  return slash < 0 ? specifier : specifier.slice(0, slash);
 }
 
 /**
  * Extract package names imported by a source file.
  * Returns bare specifiers only (not relative paths, not Node builtins).
- *
- * Uses a two-pass approach for accuracy:
- * 1. Strip comments (// and /* ... * /) while respecting string literals
- * 2. Apply regex patterns on comment-free source
  */
 function extractImports(content: string): Set<string> {
   const imports = new Set<string>();
   const cleaned = stripComments(content);
 
-  for (const pattern of IMPORT_PATTERNS) {
-    // Reset lastIndex for each file
-    pattern.lastIndex = 0;
-    let match;
-    while ((match = pattern.exec(cleaned)) !== null) {
-      const specifier = match[1];
-
-      // Skip relative imports (should not match patterns, but defensive)
-      if (specifier.startsWith('.')) continue;
-
-      // Skip Node.js builtins
-      if (isNodeBuiltin(specifier)) continue;
-
-      const pkgName = extractPackageName(specifier);
-      if (pkgName) {
-        imports.add(pkgName);
-      }
-    }
+  IMPORT_PATTERN.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = IMPORT_PATTERN.exec(cleaned)) !== null) {
+    const specifier = m[1] ?? m[2] ?? m[3] ?? m[4];
+    if (!specifier) continue;
+    if (specifier.charCodeAt(0) === 46 /* . */) continue;
+    if (isNodeBuiltin(specifier)) continue;
+    const pkgName = extractPackageName(specifier);
+    if (pkgName) imports.add(pkgName);
   }
 
   return imports;
+}
+
+/**
+ * mtime-keyed cache of per-file extracted package sets. Keeps repeated
+ * scans (watch mode, multi-invocation test runs) from re-reading and
+ * re-parsing unchanged files. The cache is process-scoped and cleared
+ * on explicit request.
+ */
+const fileCache = new Map<string, { mtimeMs: number; packages: Set<string> }>();
+
+/** Testing hook: clear memoization between test cases. */
+export function clearImportChainCache(): void {
+  fileCache.clear();
 }
 
 /**
@@ -179,12 +181,19 @@ export function scanImportChains(
 
   for (const dir of entryDirs) {
     const fullDir = join(projectDir, dir);
-    if (existsSync(fullDir) && statSync(fullDir).isDirectory()) {
-      walkDir(fullDir, scannedFiles, importedPackages);
+    if (existsSync(fullDir)) {
+      // We check isDirectory via the withFileTypes walk, but need to guard
+      // against `fullDir` itself being a file — readdirSync on a file throws.
+      try {
+        if (statSync(fullDir).isDirectory()) {
+          walkDir(fullDir, scannedFiles, importedPackages);
+        }
+      } catch {
+        // ignore unreadable
+      }
     }
   }
 
-  // Also scan root-level entry points
   for (const entry of ['index.js', 'index.ts', 'index.mjs', 'server.js', 'server.ts', 'main.js', 'main.ts']) {
     const entryPath = join(projectDir, entry);
     if (existsSync(entryPath)) {
@@ -196,27 +205,28 @@ export function scanImportChains(
   return importedPackages;
 }
 
-function walkDir(dir: string, scanned: Set<string>, imports: Set<string>): void {
-  try {
-    const entries = readdirSync(dir);
-    for (const entry of entries) {
-      // Skip common non-source dirs
-      if (entry === 'node_modules' || entry === '.git' || entry === 'dist' || entry === 'build' || entry === 'coverage') continue;
+const MAX_SCAN_DEPTH = 15;
+const MAX_SCAN_FILES = 10_000;
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage']);
 
-      const fullPath = join(dir, entry);
-      try {
-        const stat = statSync(fullPath);
-        if (stat.isDirectory()) {
-          walkDir(fullPath, scanned, imports);
-        } else if (stat.isFile() && JS_EXTENSIONS.has(extname(entry))) {
-          scanFile(fullPath, scanned, imports);
-        }
-      } catch {
-        // Skip unreadable entries
-      }
-    }
+function walkDir(dir: string, scanned: Set<string>, imports: Set<string>, depth: number = 0): void {
+  if (depth > MAX_SCAN_DEPTH || scanned.size > MAX_SCAN_FILES) return;
+  let entries;
+  try {
+    // withFileTypes halves syscalls by returning Dirent (no per-entry stat).
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    // Skip unreadable directories
+    return;
+  }
+  for (const entry of entries) {
+    const name = entry.name;
+    if (SKIP_DIRS.has(name)) continue;
+    const fullPath = join(dir, name);
+    if (entry.isDirectory()) {
+      walkDir(fullPath, scanned, imports, depth + 1);
+    } else if (entry.isFile() && JS_EXTENSIONS.has(extname(name))) {
+      scanFile(fullPath, scanned, imports);
+    }
   }
 }
 
@@ -225,11 +235,25 @@ function scanFile(filePath: string, scanned: Set<string>, imports: Set<string>):
   if (scanned.has(resolved)) return;
   scanned.add(resolved);
 
+  // mtime-keyed memoization — unchanged files skip read + parse.
+  let mtimeMs: number | undefined;
+  try {
+    mtimeMs = statSync(resolved).mtimeMs;
+  } catch {
+    return;
+  }
+
+  const cached = fileCache.get(resolved);
+  if (cached && cached.mtimeMs === mtimeMs) {
+    for (const pkg of cached.packages) imports.add(pkg);
+    return;
+  }
+
   try {
     const content = readFileSync(resolved, 'utf-8');
-    for (const pkg of extractImports(content)) {
-      imports.add(pkg);
-    }
+    const pkgs = extractImports(content);
+    fileCache.set(resolved, { mtimeMs, packages: pkgs });
+    for (const pkg of pkgs) imports.add(pkg);
   } catch {
     // Skip unreadable files
   }

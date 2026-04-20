@@ -1,97 +1,80 @@
 /**
- * Production reachability analysis.
+ * Dependency graph traversal: shortest-path parent links + lazy path resolution.
  *
- * Strategy A (npm): Pre-computed flags already set during parsing. No-op.
- * Strategy B (yarn/pnpm): BFS from production roots with visited set. O(V+E).
+ * The original implementation eagerly materialized `dependencyPath: string[]`
+ * on every node during BFS, duplicating ancestor names O(V*D) times — tens of
+ * MB on deep monorepos even though only the tiny subset of nodes that match a
+ * vulnerability actually need the path.
+ *
+ * New strategy: record a single `parentKey` link per node during BFS (O(V+E)
+ * time, O(V) extra pointers) and expose `resolveDependencyPath` for callers
+ * (matcher.ts) to walk the parent chain on demand for matched nodes only.
+ *
+ * Public API surface preserved:
+ *   - computeDependencyPaths(graph) — unchanged signature; now populates
+ *     parent links instead of full arrays. `node.dependencyPath` stays `[]`
+ *     until a consumer calls the resolver.
  */
 import type { DependencyGraph } from '../../types/package.js';
 
+/** Internal parent-link store keyed by graph key. */
+const parentLinks = new WeakMap<DependencyGraph, Map<string, string | null>>();
+
 /**
- * BFS from production roots to mark all reachable nodes as isProduction.
- * Used for yarn/pnpm where lockfiles don't have pre-computed dev flags.
- *
- * @param graph - The dependency graph (mutated in place)
- * @param productionRoots - Package names from package.json `dependencies`
+ * BFS from depth-1 roots recording the first (shortest) parent that reaches
+ * each node. Replaces the previous per-node array copy.
  */
-export function markProductionReachable(
-  graph: DependencyGraph,
-  productionRoots: string[],
-): void {
-  // Find graph keys matching production root names
-  const rootKeys: string[] = [];
-  for (const rootName of productionRoots) {
-    for (const [key, node] of graph) {
-      if (node.name === rootName && node.depth === 1) {
-        rootKeys.push(key);
-      }
+export function computeDependencyPaths(graph: DependencyGraph): void {
+  const parents = new Map<string, string | null>();
+  const queue: string[] = [];
+
+  // Seed: depth-1 nodes have no parent.
+  for (const [key, node] of graph) {
+    if (node.depth === 1) {
+      parents.set(key, null);
+      queue.push(key);
     }
   }
 
-  // BFS with visited set (handles circular dependencies)
-  const visited = new Set<string>();
-  const queue = [...rootKeys];
-  let qi = 0;
-
-  while (qi < queue.length) {
-    const current = queue[qi++];
-    if (visited.has(current)) continue;
-    visited.add(current);
-
+  // BFS — first visit wins (shortest path).
+  for (let qi = 0; qi < queue.length; qi++) {
+    const current = queue[qi];
     const node = graph.get(current);
     if (!node) continue;
 
-    node.isProduction = true;
-    node.isDev = false;
-
     for (const depKey of node.dependencies) {
-      if (!visited.has(depKey)) {
-        queue.push(depKey);
-      }
-    }
-  }
-
-  // Everything not visited is dev-only
-  for (const [key, node] of graph) {
-    if (!visited.has(key)) {
-      node.isDev = true;
-      node.isProduction = false;
-    }
-  }
-}
-
-/**
- * Compute dependency paths from root to each node (shortest path).
- * BFS from depth-1 nodes.
- */
-export function computeDependencyPaths(graph: DependencyGraph): void {
-  const visited = new Set<string>();
-
-  // Start from depth-1 nodes (direct dependencies)
-  const roots: string[] = [];
-  for (const [key, node] of graph) {
-    if (node.depth === 1) {
-      node.dependencyPath = [node.name];
-      roots.push(key);
-    }
-  }
-
-  const queue = [...roots];
-  for (const key of roots) visited.add(key);
-  let qi2 = 0;
-
-  while (qi2 < queue.length) {
-    const current = queue[qi2++];
-    const node = graph.get(current)!;
-
-    for (const depKey of node.dependencies) {
-      if (visited.has(depKey)) continue;
-      visited.add(depKey);
-
-      const depNode = graph.get(depKey);
-      if (!depNode) continue;
-
-      depNode.dependencyPath = [...node.dependencyPath, depNode.name];
+      if (parents.has(depKey)) continue;
+      parents.set(depKey, current);
       queue.push(depKey);
     }
   }
+
+  parentLinks.set(graph, parents);
+}
+
+/**
+ * Resolve the root→node name path for a graph key on demand.
+ * Safe on cycles (parent map can't form a cycle because BFS records only the
+ * first parent to reach each node, which is an ancestor). Returns an empty
+ * array if the key isn't in the graph.
+ */
+export function resolveDependencyPath(
+  graph: DependencyGraph,
+  key: string,
+): string[] {
+  const parents = parentLinks.get(graph);
+  if (!parents) return [];
+
+  const names: string[] = [];
+  let cursor: string | null | undefined = key;
+  // Guard against pathological inputs (self-loops, missing links).
+  const seen = new Set<string>();
+  while (cursor != null && !seen.has(cursor)) {
+    seen.add(cursor);
+    const node = graph.get(cursor);
+    if (!node) break;
+    names.push(node.name);
+    cursor = parents.get(cursor) ?? null;
+  }
+  return names.reverse();
 }

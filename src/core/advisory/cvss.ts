@@ -63,17 +63,29 @@ function parseMetrics(vector: string): Record<string, string> {
 }
 
 function computeBaseScore(m: Record<string, string>): number {
-  const av = METRIC_WEIGHTS.AV[m.AV] ?? 0;
-  const ac = METRIC_WEIGHTS.AC[m.AC] ?? 0;
-  const ui = METRIC_WEIGHTS.UI[m.UI] ?? 0;
+  // Validate required metrics exist — return 0 for malformed vectors instead of silent underscoring
+  const requiredMetrics = ['AV', 'AC', 'PR', 'UI', 'S', 'C', 'I', 'A'] as const;
+  for (const metric of requiredMetrics) {
+    if (!m[metric]) return 0;
+  }
+
+  const av = METRIC_WEIGHTS.AV[m.AV];
+  const ac = METRIC_WEIGHTS.AC[m.AC];
+  const ui = METRIC_WEIGHTS.UI[m.UI];
   const scopeChanged = m.S === 'C';
 
   const prWeights = scopeChanged ? METRIC_WEIGHTS.PR_CHANGED : METRIC_WEIGHTS.PR;
-  const pr = prWeights[m.PR] ?? 0;
+  const pr = prWeights[m.PR];
 
-  const c = METRIC_WEIGHTS.C[m.C] ?? 0;
-  const i = METRIC_WEIGHTS.I[m.I] ?? 0;
-  const a = METRIC_WEIGHTS.A[m.A] ?? 0;
+  const c = METRIC_WEIGHTS.C[m.C];
+  const i = METRIC_WEIGHTS.I[m.I];
+  const a = METRIC_WEIGHTS.A[m.A];
+
+  // Return 0 for unknown metric values rather than silently defaulting
+  if (av === undefined || ac === undefined || ui === undefined || pr === undefined ||
+      c === undefined || i === undefined || a === undefined) {
+    return 0;
+  }
 
   // Impact Sub Score
   const iss = 1 - ((1 - c) * (1 - i) * (1 - a));

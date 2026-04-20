@@ -97,19 +97,17 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
   logger.info('Matching advisories...');
   const allMatches = matchAdvisories(lockfileResult.graph, advisories);
 
-  // Annotate matches with workspace info
-  if (depToWorkspaces) {
-    for (const match of allMatches) {
+  // Annotate matches with workspace info and import-chain reachability in a
+  // single pass. Merged from two separate loops — the work is O(1) per match
+  // so there's no reason to iterate the list twice.
+  for (const match of allMatches) {
+    if (depToWorkspaces) {
       const graphKey = `${match.package}@${match.installedVersion}`;
       const ws = depToWorkspaces.get(graphKey);
       if (ws && ws.size > 0) {
         match.workspaces = [...ws];
       }
     }
-  }
-
-  // Annotate matches with import chain reachability
-  for (const match of allMatches) {
     match.isDirectlyImported = isDirectlyImported(match.package, importedPackages);
   }
 
@@ -142,33 +140,24 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
     logger.debug(`EPSS: ${epssScores.size} scores, KEV: ${kevSet.size} entries`);
   }
 
-  // 8. Score and sort
-  let scored = scoreAllMatches(matches, scorerCtx);
+  // 8. Score, sort, and filter in single pass
+  const severityRank: Record<RiskScore['label'], number> = {
+    critical: 4,
+    high: 3,
+    medium: 2,
+    low: 1,
+    info: 0,
+  };
+  const minRank = (options.severityThreshold && options.severityThreshold !== 'info')
+    ? (severityRank[options.severityThreshold] ?? 0)
+    : 0;
 
-  // Filter by workspace if requested
-  if (options.workspace) {
-    scored = scored.filter((s) =>
-      s.match.workspaces?.includes(options.workspace!) ?? false,
-    );
-  }
-
-  // Filter production-only if requested
-  if (options.productionOnly) {
-    scored = scored.filter((s) => s.match.isProduction);
-  }
-
-  // Filter by severity threshold
-  if (options.severityThreshold && options.severityThreshold !== 'info') {
-    const severityRank: Record<RiskScore['label'], number> = {
-      critical: 4,
-      high: 3,
-      medium: 2,
-      low: 1,
-      info: 0,
-    };
-    const minRank = severityRank[options.severityThreshold] ?? 0;
-    scored = scored.filter((s) => severityRank[s.risk.label] >= minRank);
-  }
+  let scored = scoreAllMatches(matches, scorerCtx).filter((s) => {
+    if (options.workspace && !(s.match.workspaces?.includes(options.workspace!) ?? false)) return false;
+    if (options.productionOnly && !s.match.isProduction) return false;
+    if (minRank > 0 && severityRank[s.risk.label] < minRank) return false;
+    return true;
+  });
 
   // Determine confidence based on skip rate (can only degrade, not upgrade)
   const skipRate = lockfileResult.skipped.length / Math.max(lockfileResult.packageCount, 1);

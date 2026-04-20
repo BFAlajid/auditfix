@@ -35,7 +35,7 @@ export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, Eps
   for (let i = 0; i < cveIds.length; i += BATCH_SIZE) {
     const batch = cveIds.slice(i, i + BATCH_SIZE);
     try {
-      const param = batch.join(',');
+      const param = batch.map(id => encodeURIComponent(id)).join(',');
       const response = await fetch(
         `https://api.first.org/data/v1/epss?cve=${param}`,
         { signal: AbortSignal.timeout(10_000) },

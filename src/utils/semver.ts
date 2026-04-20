@@ -24,24 +24,3 @@ export function satisfies(version: string, range: string): boolean {
     return false;
   }
 }
-
-/** Clean a version string — returns null if invalid */
-export function cleanVersion(version: string): string | null {
-  if (version.length > MAX_VERSION_LENGTH) return null;
-  return semver.clean(version);
-}
-
-/** Compare two versions */
-export function compareVersions(a: string, b: string): -1 | 0 | 1 {
-  return semver.compare(a, b);
-}
-
-/** Find the max version satisfying a range */
-export function maxSatisfying(versions: string[], range: string): string | null {
-  return semver.maxSatisfying(versions, range, PRERELEASE_OPTS);
-}
-
-/** Check if a fix version is within a parent's declared range (safe update check) */
-export function isSafeUpdate(fixVersion: string, parentRange: string): boolean {
-  return semver.satisfies(fixVersion, parentRange, PRERELEASE_OPTS);
-}
