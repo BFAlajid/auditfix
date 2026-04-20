@@ -21,7 +21,8 @@ import * as logger from '../../utils/logger.js';
 const OSV_BATCH_URL = 'https://api.osv.dev/v1/querybatch';
 const OSV_VULN_URL = 'https://api.osv.dev/v1/vulns';
 const MAX_BATCH_SIZE = 1000;
-const MAX_CONCURRENT_FETCHES = 10;
+const MAX_CONCURRENT_FETCHES = 10; // applies to individual vuln-detail GETs
+const MAX_CONCURRENT_BATCHES = 5; // applies to POST /querybatch — heavier server-side, keep lower
 const MAX_RESPONSE_SIZE = 50 * 1024 * 1024; // 50MB
 const MAX_INDIVIDUAL_SIZE = 1 * 1024 * 1024; // 1MB
 
@@ -53,9 +54,12 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
     batches.push(packages.slice(i, i + MAX_BATCH_SIZE));
   }
 
-  // Execute batch queries
+  // Execute batch queries with bounded parallelism.
+  // Sequential awaits here previously made 50k-package scans 50 serial round trips.
+  // Failures are isolated per-batch via Promise.allSettled — one bad batch does not abort the rest.
   const allVulnIds = new Set<string>();
-  for (const batch of batches) {
+
+  const runBatch = async (batch: typeof packages): Promise<OsvBatchResponse> => {
     const query: OsvBatchQuery = {
       queries: batch.map((pkg) => ({
         version: pkg.version,
@@ -65,28 +69,35 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
         },
       })),
     };
+    const response = await fetchWithValidation(OSV_BATCH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(query),
+    }, MAX_RESPONSE_SIZE);
+    return response as OsvBatchResponse;
+  };
 
-    try {
-      const response = await fetchWithValidation(OSV_BATCH_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(query),
-      }, MAX_RESPONSE_SIZE);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
+    const chunk = batches.slice(i, i + MAX_CONCURRENT_BATCHES);
+    const results = await Promise.allSettled(chunk.map((batch) => runBatch(batch)));
 
-      const batchResponse = response as OsvBatchResponse;
-      if (batchResponse.results) {
-        for (const result of batchResponse.results) {
-          if (result.vulns) {
-            for (const vuln of result.vulns) {
-              allVulnIds.add(vuln.id);
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        const batchResponse = result.value;
+        if (batchResponse.results) {
+          for (const r of batchResponse.results) {
+            if (r.vulns) {
+              for (const vuln of r.vulns) {
+                allVulnIds.add(vuln.id);
+              }
             }
           }
         }
+      } else {
+        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        errors.push(`OSV batch query failed: ${msg}`);
+        logger.warn(`OSV batch query failed: ${msg}`);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`OSV batch query failed: ${msg}`);
-      logger.warn(`OSV batch query failed: ${msg}`);
     }
   }
 
@@ -115,31 +126,41 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
     }
   }
 
-  // Convert to Advisory map keyed by package name
+  // Convert to Advisory map keyed by package name.
+  // Each advisory is parsed in a try/catch so a single malformed `affected` entry
+  // does not drop the other advisories in the response.
   const advisories = new Map<string, Advisory[]>();
 
   for (const vuln of fullVulns) {
+    if (!vuln || !Array.isArray(vuln.affected)) continue;
     for (const affected of vuln.affected) {
-      if (affected.package.ecosystem.toLowerCase() !== 'npm') continue;
+      try {
+        if (!affected?.package?.ecosystem || !affected.package.name) continue;
+        if (affected.package.ecosystem.toLowerCase() !== 'npm') continue;
+        if (!Array.isArray(affected.ranges)) continue;
 
-      const pkgName = affected.package.name;
-      const advisory: Advisory = {
-        id: vuln.id,
-        aliases: vuln.aliases ?? [],
-        summary: vuln.summary ?? '',
-        details: vuln.details ?? '',
-        severity: vuln.severity ?? [],
-        affectedRange: affectedToSemverRange(affected),
-        fixVersion: affectedFixVersion(affected),
-        publishedAt: vuln.published ?? vuln.modified,
-        modifiedAt: vuln.modified,
-        references: vuln.references ?? [],
-        source: 'osv-api',
-      };
+        const pkgName = affected.package.name;
+        const advisory: Advisory = {
+          id: vuln.id,
+          aliases: vuln.aliases ?? [],
+          summary: vuln.summary ?? '',
+          details: vuln.details ?? '',
+          severity: vuln.severity ?? [],
+          affectedRange: affectedToSemverRange(affected),
+          fixVersion: affectedFixVersion(affected),
+          publishedAt: vuln.published ?? vuln.modified,
+          modifiedAt: vuln.modified,
+          references: vuln.references ?? [],
+          source: 'osv-api',
+        };
 
-      const existing = advisories.get(pkgName) ?? [];
-      existing.push(advisory);
-      advisories.set(pkgName, existing);
+        const existing = advisories.get(pkgName) ?? [];
+        existing.push(advisory);
+        advisories.set(pkgName, existing);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`Skipping malformed OSV affected entry in ${vuln.id}: ${msg}`);
+      }
     }
   }
 
