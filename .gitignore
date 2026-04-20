@@ -1,5 +1,9 @@
 node_modules/
-dist/
 coverage/
 *.tsbuildinfo
+
+# Ignore build output from CLI but NOT the committed action bundle.
+# dist/action/ ships with the GitHub Action — must be tracked.
+dist/*
+!dist/action/
 

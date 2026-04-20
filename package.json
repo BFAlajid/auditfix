@@ -27,7 +27,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "lint": "tsc --noEmit",
+    "lint": "biome check . && tsc --noEmit",
+    "lint:fix": "biome check --write .",
     "build:index": "tsx scripts/build-offline-index.ts",
     "prepublishOnly": "npm run build && npm test"
   },
@@ -46,6 +47,8 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.17.0",
     "@types/semver": "^7.5.8",
+    "@biomejs/biome": "^1.9.4",
+    "@cyclonedx/cyclonedx-npm": "^2.0.0",
     "@vitest/coverage-v8": "^2.1.9",
     "tsx": "^4.19.0",
     "tsup": "^8.3.5",
@@ -54,7 +57,9 @@
   },
   "files": [
     "dist",
-    "data"
+    "action.yml",
+    "README.md",
+    "LICENSE"
   ],
   "license": "MIT",
   "keywords": [
