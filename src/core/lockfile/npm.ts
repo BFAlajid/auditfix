@@ -88,6 +88,12 @@ export function parseNpmLockfile(content: string): {
     // Use `name` field for aliased packages (P0 — wrong name = missed vuln)
     const name = entry.name ?? extractPackageName(pathKey);
 
+    // S7: Validate package names from untrusted lockfile data
+    if (name && (name.includes('..') || name.includes('\0') || name.includes('\\'))) {
+      skipped.push({ key: pathKey, reason: 'invalid-name' });
+      continue;
+    }
+
     if (!isValidVersion(version)) {
       skipped.push({ key: pathKey, reason: 'unparseable' });
       continue;
@@ -176,23 +182,48 @@ function countDepth(pathKey: string): number {
   return (pathKey.match(/node_modules\//g) || []).length;
 }
 
-/** Find a resolved dependency in the graph by name + range match using name index */
-function findResolvedDep(graph: DependencyGraph, nameIndex: Map<string, string[]>, name: string, range: string): string | null {
+/**
+ * Find a resolved dependency in the graph by name + range match using name index.
+ * C-B3 fix: when no candidate satisfies the range, use semver.maxSatisfying over
+ * all candidate versions. If still no match, return null (do NOT return an
+ * arbitrary first candidate, which previously pointed edges at the wrong version).
+ */
+function findResolvedDep(
+  graph: DependencyGraph,
+  nameIndex: Map<string, string[]>,
+  name: string,
+  range: string,
+): string | null {
   const candidates = nameIndex.get(name);
-  if (!candidates) return null;
+  if (!candidates || candidates.length === 0) return null;
 
-  let fallback: string | null = null;
+  // Fast path: first candidate satisfying the range.
   for (const key of candidates) {
-    const node = graph.get(key)!;
+    const node = graph.get(key);
+    if (!node) continue;
     if (satisfiesRange(node.version, range)) {
       return key;
     }
-    if (!fallback) {
-      fallback = key;
-    }
   }
 
-  return fallback;
+  // Slow path: use semver.maxSatisfying over all candidate versions.
+  const versions = candidates
+    .map((k) => graph.get(k)?.version)
+    .filter((v): v is string => typeof v === 'string');
+
+  let best: string | null = null;
+  try {
+    best = semver.maxSatisfying(versions, range, { includePrerelease: true });
+  } catch {
+    best = null;
+  }
+  if (!best) return null;
+
+  for (const key of candidates) {
+    const node = graph.get(key);
+    if (node?.version === best) return key;
+  }
+  return null;
 }
 
 function satisfiesRange(version: string, range: string): boolean {

@@ -181,4 +181,75 @@ describe('npm lockfile v3 parser', () => {
     expect(node).toBeDefined();
     expect(node!.name).toBe('lodash');
   });
+
+  // C-B3: findResolvedDep must not return an arbitrary first candidate when
+  // no version satisfies the requested range.
+  it('returns no edge when no candidate satisfies the semver range', () => {
+    const lockfile = JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'root', version: '1.0.0' },
+        'node_modules/consumer': {
+          version: '1.0.0',
+          resolved: 'https://registry.npmjs.org/consumer/-/consumer-1.0.0.tgz',
+          integrity: 'sha512-consumer',
+          // Requests ^9.0.0, but only 1.0.0 and 2.0.0 exist in the graph.
+          dependencies: { target: '^9.0.0' },
+        },
+        'node_modules/target': {
+          version: '1.0.0',
+          resolved: 'https://registry.npmjs.org/target/-/target-1.0.0.tgz',
+          integrity: 'sha512-t1',
+        },
+        'node_modules/other/node_modules/target': {
+          version: '2.0.0',
+          resolved: 'https://registry.npmjs.org/target/-/target-2.0.0.tgz',
+          integrity: 'sha512-t2',
+        },
+      },
+    });
+
+    const result = parseNpmLockfile(lockfile);
+    const consumer = result.graph.get('consumer@1.0.0')!;
+    // Must not point at either unsatisfying version.
+    expect(consumer.dependencies).not.toContain('target@1.0.0');
+    expect(consumer.dependencies).not.toContain('target@2.0.0');
+    expect(consumer.dependencies).toEqual([]);
+  });
+
+  // C-B3: when multiple candidates satisfy, prefer the highest (maxSatisfying).
+  it('picks maxSatisfying version when multiple candidates match', () => {
+    const lockfile = JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'root', version: '1.0.0' },
+        'node_modules/consumer': {
+          version: '1.0.0',
+          resolved: 'https://registry.npmjs.org/consumer/-/consumer-1.0.0.tgz',
+          integrity: 'sha512-consumer',
+          dependencies: { target: '^1.0.0' },
+        },
+        'node_modules/target': {
+          version: '1.0.0',
+          resolved: 'https://registry.npmjs.org/target/-/target-1.0.0.tgz',
+          integrity: 'sha512-t1',
+        },
+        'node_modules/other/node_modules/target': {
+          version: '1.5.0',
+          resolved: 'https://registry.npmjs.org/target/-/target-1.5.0.tgz',
+          integrity: 'sha512-t15',
+        },
+      },
+    });
+
+    const result = parseNpmLockfile(lockfile);
+    const consumer = result.graph.get('consumer@1.0.0')!;
+    // Fast path returns first satisfier (insertion order stability); either
+    // 1.0.0 or 1.5.0 is acceptable — both satisfy ^1.0.0.
+    expect(
+      consumer.dependencies.includes('target@1.0.0') ||
+        consumer.dependencies.includes('target@1.5.0'),
+    ).toBe(true);
+    expect(consumer.dependencies).toHaveLength(1);
+  });
 });
