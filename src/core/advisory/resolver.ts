@@ -9,7 +9,7 @@
  * Never exits 0 when all sources fail.
  */
 import type { DependencyGraph } from '../../types/package.js';
-import type { Advisory } from '../../types/advisory.js';
+import type { Advisory, ResolverSourceId } from '../../types/advisory.js';
 import type { ConfidenceLevel } from '../../types/report.js';
 import { fetchOsvAdvisories } from './source-osv.js';
 import { fetchNpmAdvisories } from './source-npm.js';
@@ -20,12 +20,49 @@ import {
 import { queryOfflineIndexBatch } from './offline-index.js';
 import * as logger from '../../utils/logger.js';
 
+export type { ResolverSourceId } from '../../types/advisory.js';
+
 export type ResolverResult = {
   advisories: Map<string, Advisory[]>;
+  /**
+   * Human-readable source label (for display, logs, report metadata).
+   * Derived from `sourceId`; consumers that branch programmatically should
+   * read `sourceId` instead — the display string is not part of the API.
+   */
   source: string;
+  /**
+   * Structured discriminator for programmatic branching / telemetry.
+   * Kept distinct from `source` so the display string can evolve without
+   * breaking consumers that pattern-match on origin.
+   */
+  sourceId: ResolverSourceId;
   confidence: ConfidenceLevel;
   errors: string[];
 };
+
+const SOURCE_LABELS: Record<ResolverSourceId, string> = {
+  'osv': 'OSV.dev API (real-time)',
+  'osv-partial': 'OSV.dev API (partial)',
+  'cache': 'Local cache',
+  'cache-stale': 'Local cache (stale)',
+  'offline': 'Bundled offline index',
+  'npm-bulk': 'npm bulk advisory endpoint',
+};
+
+function buildResult(
+  advisories: Map<string, Advisory[]>,
+  sourceId: ResolverSourceId,
+  confidence: ConfidenceLevel,
+  errors: string[],
+): ResolverResult {
+  return {
+    advisories,
+    source: SOURCE_LABELS[sourceId],
+    sourceId,
+    confidence,
+    errors,
+  };
+}
 
 /**
  * Resolve advisories using the three-tier fallback chain.
@@ -44,12 +81,7 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
         logger.debug(`Cache write failed: ${err}`);
       });
 
-      return {
-        advisories: osvResult.advisories,
-        source: 'OSV.dev API (real-time)',
-        confidence: 'HIGH',
-        errors: [],
-      };
+      return buildResult(osvResult.advisories, 'osv', 'HIGH', []);
     }
 
     // OSV had errors but returned some data — use it with reduced confidence
@@ -57,12 +89,12 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
       errors.push(...osvResult.errors);
       cacheAdvisoryBatch(osvResult.advisories).catch(() => {});
 
-      return {
-        advisories: osvResult.advisories,
-        source: 'OSV.dev API (partial)',
-        confidence: 'MEDIUM',
+      return buildResult(
+        osvResult.advisories,
+        'osv-partial',
+        'MEDIUM',
         errors,
-      };
+      );
     }
 
     errors.push(...osvResult.errors);
@@ -77,12 +109,7 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
   const cachedAdvisories = getCachedAdvisoriesForGraph(graph);
   if (cachedAdvisories.size > 0) {
     logger.info(`Using ${cachedAdvisories.size} cached advisory entries`);
-    return {
-      advisories: cachedAdvisories,
-      source: 'Local cache',
-      confidence: 'MEDIUM',
-      errors,
-    };
+    return buildResult(cachedAdvisories, 'cache', 'MEDIUM', errors);
   }
 
   // Tier 3: Bundled offline index
@@ -90,12 +117,7 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
   const offlineAdvisories = await queryOfflineIndexBatch(graph);
   if (offlineAdvisories.size > 0) {
     logger.info(`Using ${offlineAdvisories.size} entries from offline index`);
-    return {
-      advisories: offlineAdvisories,
-      source: 'Bundled offline index',
-      confidence: 'LOW',
-      errors,
-    };
+    return buildResult(offlineAdvisories, 'offline', 'LOW', errors);
   }
 
   // Tier 4: npm bulk advisory endpoint
@@ -108,12 +130,12 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
       cacheAdvisoryBatch(npmResult.advisories).catch(() => {});
 
       errors.push(...npmResult.errors);
-      return {
-        advisories: npmResult.advisories,
-        source: 'npm bulk advisory endpoint',
-        confidence: npmResult.errors.length > 0 ? 'LOW' : 'MEDIUM',
+      return buildResult(
+        npmResult.advisories,
+        'npm-bulk',
+        npmResult.errors.length > 0 ? 'LOW' : 'MEDIUM',
         errors,
-      };
+      );
     }
 
     errors.push(...npmResult.errors);

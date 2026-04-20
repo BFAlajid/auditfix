@@ -25,6 +25,30 @@ export function satisfies(version: string, range: string): boolean {
   }
 }
 
+/**
+ * Pre-compile a semver range string into a reusable `semver.Range` instance.
+ * Use this when the same range is tested against many versions in a hot loop:
+ * calling `satisfies` re-parses the range string on every invocation, while
+ * a compiled Range amortizes that cost. Returns null on an invalid range.
+ */
+export function compileRange(range: string): semver.Range | null {
+  try {
+    return new semver.Range(range, PRERELEASE_OPTS);
+  } catch {
+    return null;
+  }
+}
+
+/** Test a version against a pre-compiled range. Honors includePrerelease. */
+export function testRange(version: string, range: semver.Range): boolean {
+  if (!isValidVersion(version)) return false;
+  try {
+    return range.test(version);
+  } catch {
+    return false;
+  }
+}
+
 /** Clean a version string — returns null if invalid */
 export function cleanVersion(version: string): string | null {
   if (version.length > MAX_VERSION_LENGTH) return null;

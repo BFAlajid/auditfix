@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scoreMatch } from '../../src/core/advisory/scorer.js';
+import { scoreMatch, scoreAllMatches } from '../../src/core/advisory/scorer.js';
 import { parseCvssVector, cvssToSeverity } from '../../src/core/advisory/cvss.js';
 import type { AdvisoryMatch, Advisory } from '../../src/types/advisory.js';
 
@@ -114,5 +114,67 @@ describe('cvssToSeverity', () => {
     expect(cvssToSeverity(5.0)).toBe('medium');
     expect(cvssToSeverity(2.0)).toBe('low');
     expect(cvssToSeverity(0)).toBe('info');
+  });
+});
+
+describe('scoreAllMatches deterministic ordering', () => {
+  function matchWithId(id: string): AdvisoryMatch {
+    const m = makeMatch({
+      isProduction: true,
+      cvssVector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
+    });
+    m.advisory = { ...m.advisory, id };
+    return m;
+  }
+
+  it('breaks ties on risk.score by advisory id (lexicographic)', () => {
+    // All three advisories produce identical risk scores — only id differs.
+    // Feed them in reverse order to confirm sort, not insertion, controls output.
+    const ordered = scoreAllMatches([
+      matchWithId('GHSA-zzzz-zzzz-zzzz'),
+      matchWithId('GHSA-aaaa-aaaa-aaaa'),
+      matchWithId('GHSA-mmmm-mmmm-mmmm'),
+    ]);
+
+    // Equal scores sanity check
+    expect(new Set(ordered.map((v) => v.risk.score)).size).toBe(1);
+
+    expect(ordered.map((v) => v.match.advisory.id)).toEqual([
+      'GHSA-aaaa-aaaa-aaaa',
+      'GHSA-mmmm-mmmm-mmmm',
+      'GHSA-zzzz-zzzz-zzzz',
+    ]);
+  });
+
+  it('produces identical ordering across independent runs', () => {
+    const inputs = () => [
+      matchWithId('GHSA-beta'),
+      matchWithId('GHSA-alpha'),
+      matchWithId('GHSA-delta'),
+      matchWithId('GHSA-gamma'),
+    ];
+
+    const first = scoreAllMatches(inputs()).map((v) => v.match.advisory.id);
+    const second = scoreAllMatches(inputs()).map((v) => v.match.advisory.id);
+
+    expect(first).toEqual(second);
+    expect(first).toEqual(['GHSA-alpha', 'GHSA-beta', 'GHSA-delta', 'GHSA-gamma']);
+  });
+
+  it('higher score still wins over lexicographic tiebreaker', () => {
+    const high = makeMatch({
+      isProduction: true,
+      cvssVector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
+    });
+    high.advisory = { ...high.advisory, id: 'GHSA-zzzz' };
+
+    const low = makeMatch({
+      isProduction: false,
+      cvssVector: 'CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N',
+    });
+    low.advisory = { ...low.advisory, id: 'GHSA-aaaa' };
+
+    const ordered = scoreAllMatches([low, high]);
+    expect(ordered[0].match.advisory.id).toBe('GHSA-zzzz');
   });
 });

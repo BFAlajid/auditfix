@@ -89,11 +89,19 @@ export function scoreMatch(match: AdvisoryMatch, ctx: ScorerContext = {}): Score
 
 /**
  * Score all matches and sort by risk (highest first).
+ *
+ * Ties on risk.score are broken deterministically by advisory id (lexicographic)
+ * so the same input always produces the same output across runs. Relying on
+ * Map / Array insertion order here is non-deterministic in practice because
+ * the upstream graph iteration order depends on lockfile parse ordering.
  */
 export function scoreAllMatches(matches: AdvisoryMatch[], ctx: ScorerContext = {}): ScoredVulnerability[] {
   return matches
     .map(m => scoreMatch(m, ctx))
-    .sort((a, b) => b.risk.score - a.risk.score);
+    .sort((a, b) => {
+      if (a.risk.score !== b.risk.score) return b.risk.score - a.risk.score;
+      return a.match.advisory.id.localeCompare(b.match.advisory.id);
+    });
 }
 
 function computeCompositeScore(factors: {

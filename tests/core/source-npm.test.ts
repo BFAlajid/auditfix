@@ -123,7 +123,8 @@ describe('fetchNpmAdvisories', () => {
     expect(lodashAdvisories).toBeDefined();
     expect(lodashAdvisories).toHaveLength(1);
     const lodash = lodashAdvisories![0];
-    expect(lodash.id).toBe('npm-1234');
+    // Key includes module_name to prevent cross-package id collisions
+    expect(lodash.id).toBe('npm-lodash-1234');
     expect(lodash.summary).toBe('Prototype Pollution');
     expect(lodash.details).toBe('lodash allows prototype pollution via merge functions');
     expect(lodash.affectedRange).toBe('<4.17.21');
@@ -140,7 +141,7 @@ describe('fetchNpmAdvisories', () => {
     const minimatchAdvisories = result.advisories.get('minimatch');
     expect(minimatchAdvisories).toBeDefined();
     expect(minimatchAdvisories).toHaveLength(1);
-    expect(minimatchAdvisories![0].id).toBe('npm-5678');
+    expect(minimatchAdvisories![0].id).toBe('npm-minimatch-5678');
     expect(minimatchAdvisories![0].fixVersion).toBe('3.0.5');
     expect(minimatchAdvisories![0].source).toBe('npm-bulk');
 
@@ -217,5 +218,73 @@ describe('fetchNpmAdvisories', () => {
     expect(result.advisories.size).toBe(0);
     expect(result.errors).toHaveLength(0);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('produces distinct ids when two packages share the same numeric advisory id', async () => {
+    // npm advisory ids are only unique within a package — two packages can
+    // report the same numeric id for unrelated vulns. Without module_name in
+    // the key, the second advisory would overwrite or collide with the first.
+    const collidingResponse = {
+      'alpha-entry': {
+        id: 42,
+        title: 'Alpha vuln',
+        severity: 'high',
+        vulnerable_versions: '<1.0.0',
+        patched_versions: '>=1.0.0',
+        module_name: 'alpha',
+        created: '2024-01-01T00:00:00.000Z',
+        updated: '2024-01-01T00:00:00.000Z',
+      },
+      'beta-entry': {
+        id: 42, // same numeric id!
+        title: 'Beta vuln',
+        severity: 'medium',
+        vulnerable_versions: '<2.0.0',
+        patched_versions: '>=2.0.0',
+        module_name: 'beta',
+        created: '2024-02-01T00:00:00.000Z',
+        updated: '2024-02-01T00:00:00.000Z',
+      },
+    };
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      mockResponse(collidingResponse)
+    ));
+
+    const graph = makeGraph([
+      ['alpha', '0.5.0'],
+      ['beta', '1.5.0'],
+    ]);
+
+    const result = await fetchNpmAdvisories(graph);
+
+    const alpha = result.advisories.get('alpha')![0];
+    const beta = result.advisories.get('beta')![0];
+
+    expect(alpha.id).toBe('npm-alpha-42');
+    expect(beta.id).toBe('npm-beta-42');
+    expect(alpha.id).not.toBe(beta.id);
+  });
+
+  it('handles missing numeric id by including package name in fallback key', async () => {
+    const response = {
+      'no-id': {
+        // id intentionally missing
+        title: 'Mystery vuln',
+        severity: 'low',
+        vulnerable_versions: '<1.0.0',
+        module_name: 'left-pad',
+        created: '2024-01-01T00:00:00.000Z',
+        updated: '2024-01-01T00:00:00.000Z',
+      },
+    };
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mockResponse(response)));
+
+    const graph = makeGraph([['left-pad', '0.5.0']]);
+    const result = await fetchNpmAdvisories(graph);
+
+    const advisory = result.advisories.get('left-pad')![0];
+    expect(advisory.id).toBe('npm-left-pad-unknown');
   });
 });
