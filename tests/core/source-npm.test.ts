@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fetchNpmAdvisories } from '../../src/core/advisory/source-npm.js';
+import { defaultNpmrcConfig } from '../../src/utils/npmrc.js';
 import type { DependencyGraph, DependencyNode } from '../../src/types/package.js';
 
 function makeNode(name: string, version: string): DependencyNode {
@@ -217,5 +218,100 @@ describe('fetchNpmAdvisories', () => {
     expect(result.advisories.size).toBe(0);
     expect(result.errors).toHaveLength(0);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT send Authorization when no npmrc config is provided', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph);
+
+    const [, init] = fetchMock.mock.calls[0];
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
+  });
+
+  it('sends Authorization header when npmrc token matches default registry', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const npmrc = defaultNpmrcConfig();
+    npmrc.authTokens['//registry.npmjs.org/'] = 'PUBLIC_TOKEN';
+
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph, { npmrc });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      'https://registry.npmjs.org/-/npm/v1/security/advisories/bulk'
+    );
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer PUBLIC_TOKEN');
+  });
+
+  it('routes a scoped package to its scope registry with its own auth', async () => {
+    // Two sequential calls — one per registry bucket.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(sampleNpmResponse))
+      .mockResolvedValueOnce(mockResponse({}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const npmrc = defaultNpmrcConfig();
+    npmrc.scopeRegistries['@acme'] = 'https://acme.example.com/';
+    npmrc.authTokens['//acme.example.com/'] = 'ACME_TOKEN';
+
+    const graph = makeGraph([
+      ['lodash', '4.17.20'],
+      ['@acme/widget', '1.0.0'],
+    ]);
+    await fetchNpmAdvisories(graph, { npmrc });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Find the call to the acme registry.
+    const acmeCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).startsWith('https://acme.example.com/')
+    );
+    expect(acmeCall).toBeDefined();
+    const acmeHeaders = (acmeCall![1] as RequestInit).headers as Record<
+      string,
+      string
+    >;
+    expect(acmeHeaders.Authorization).toBe('Bearer ACME_TOKEN');
+
+    // The public registry call should have no Authorization header.
+    const publicCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).startsWith('https://registry.npmjs.org/')
+    );
+    expect(publicCall).toBeDefined();
+    const publicHeaders = (publicCall![1] as RequestInit).headers as Record<
+      string,
+      string
+    >;
+    expect(publicHeaders.Authorization).toBeUndefined();
+  });
+
+  it('omits Authorization when no token matches the registry', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Config with auth for a different registry.
+    const npmrc = defaultNpmrcConfig();
+    npmrc.authTokens['//other.example.com/'] = 'OTHER_TOKEN';
+
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph, { npmrc });
+
+    const [, init] = fetchMock.mock.calls[0];
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
   });
 });
