@@ -9,13 +9,21 @@ import { parseNpmLockfile } from './npm.js';
 import { parseYarnClassicLockfile } from './yarn-classic.js';
 import { parseYarnBerryLockfile } from './yarn-berry.js';
 import { parsePnpmLockfile } from './pnpm.js';
+import { parseBunLockfile } from './bun.js';
+import { parseDenoLockfile } from './deno.js';
 import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
 
+// Order matters: npm/yarn/pnpm take precedence when multiple lockfiles
+// are present so established toolchains keep their canonical parser. Bun
+// and Deno fall in below them.
 const LOCKFILE_PRIORITY = [
   'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
+  'bun.lock',
+  'bun.lockb',
+  'deno.lock',
 ] as const;
 
 export function detectAndParseLockfile(projectDir: string): LockfileParseResult {
@@ -28,14 +36,16 @@ export function detectAndParseLockfile(projectDir: string): LockfileParseResult 
   }
 
   throw new Error(
-    'No lockfile found. auditfix requires a package-lock.json, yarn.lock, or pnpm-lock.yaml. Run `npm install` to generate one.'
+    'No lockfile found. auditfix requires a package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lock, or deno.lock. Run `npm install` to generate one.'
   );
 }
 
 function parseLockfile(projectDir: string, path: string, filename: string): LockfileParseResult {
-  const content = readFileSync(path, 'utf-8');
+  // bun.lockb is binary — read raw and let the bun parser decide.
+  const isBunBinary = filename === 'bun.lockb';
+  const content = readFileSync(path, isBunBinary ? 'binary' : 'utf-8');
 
-  if (content.trim().length === 0) {
+  if (!isBunBinary && content.trim().length === 0) {
     throw new Error(`Lockfile ${filename} is empty. Run \`npm install\` to regenerate.`);
   }
 
@@ -72,6 +82,25 @@ function parseLockfile(projectDir: string, path: string, filename: string): Lock
     }
     case 'pnpm-lock.yaml': {
       const result = parsePnpmLockfile(content);
+      return {
+        type: result.type,
+        graph: result.graph,
+        packageCount: result.graph.size,
+        skipped: result.skipped,
+      };
+    }
+    case 'bun.lock':
+    case 'bun.lockb': {
+      const result = parseBunLockfile(content);
+      return {
+        type: result.type,
+        graph: result.graph,
+        packageCount: result.graph.size,
+        skipped: result.skipped,
+      };
+    }
+    case 'deno.lock': {
+      const result = parseDenoLockfile(content);
       return {
         type: result.type,
         graph: result.graph,
