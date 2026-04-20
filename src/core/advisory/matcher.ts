@@ -11,6 +11,7 @@ import semver from 'semver';
 import type { DependencyGraph } from '../../types/package.js';
 import type { Advisory, AdvisoryMatch } from '../../types/advisory.js';
 import { compileRange, testRange, satisfies } from '../../utils/semver.js';
+import { resolveDependencyPath } from '../graph/reachability.js';
 
 /**
  * Match a map of advisories against the dependency graph.
@@ -32,7 +33,7 @@ export function matchAdvisories(
   // back to the string-based `satisfies` path.
   const compiled = new WeakMap<Advisory, semver.Range | null>();
 
-  for (const [, node] of graph) {
+  for (const [key, node] of graph) {
     const pkgAdvisories = advisories.get(node.name);
     if (!pkgAdvisories) continue;
 
@@ -50,6 +51,9 @@ export function matchAdvisories(
         : satisfies(node.version, advisory.affectedRange);
 
       if (isAffected) {
+        const path = node.dependencyPath.length > 0
+          ? node.dependencyPath
+          : resolveDependencyPath(graph, key);
         matches.push({
           advisory,
           package: node.name,

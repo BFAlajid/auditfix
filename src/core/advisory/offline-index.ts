@@ -99,6 +99,7 @@ export function resetOfflineIndexState(): void {
   indexReady = null;
   indexLoadFailures = 0;
   BUILTIN_INDEX = HARDCODED_INDEX;
+  INDEX_BY_NAME = buildNameIndex(HARDCODED_INDEX);
 }
 
 /**
@@ -186,6 +187,7 @@ function ensureIndex(): Promise<void> {
     try {
       const gen = await loadGeneratedIndex();
       BUILTIN_INDEX = buildEffectiveIndex(gen);
+      INDEX_BY_NAME = buildNameIndex(BUILTIN_INDEX);
       indexLoadFailures = 0;
     } catch (err) {
       indexLoadFailures += 1;

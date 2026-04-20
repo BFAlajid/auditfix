@@ -195,6 +195,7 @@ export async function resolveAdvisoriesWithCache(
       logger.info(`All ${packageNames.length} packages served from fresh cache (<1h)`);
       return {
         advisories: cached.advisories,
+        sourceId: 'cache',
         source: 'Local cache (fresh)',
         confidence: 'HIGH',
         errors: [],
@@ -209,6 +210,7 @@ export async function resolveAdvisoriesWithCache(
       });
       return {
         advisories: cached.advisories,
+        sourceId: 'cache-stale',
         source: 'Local cache (stale, refreshing)',
         confidence: 'HIGH',
         errors: [],

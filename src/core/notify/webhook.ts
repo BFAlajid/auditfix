@@ -203,27 +203,6 @@ export async function isValidWebhookUrl(url: string): Promise<WebhookValidationR
 }
 
 /**
- * Validate that a webhook URL is safe (no SSRF to internal networks).
- */
-export function isValidWebhookUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-    const hostname = parsed.hostname.toLowerCase();
-    // Block localhost, loopback, link-local, and metadata endpoints
-    if (['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]'].includes(hostname)) return false;
-    if (hostname.startsWith('169.254.')) return false; // AWS/cloud metadata
-    if (hostname.startsWith('10.')) return false;
-    if (hostname.startsWith('172.') && parseInt(hostname.split('.')[1]) >= 16 && parseInt(hostname.split('.')[1]) <= 31) return false;
-    if (hostname.startsWith('192.168.')) return false;
-    if (hostname.endsWith('.internal') || hostname.endsWith('.local')) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Send audit results to a webhook URL.
  * Supports Slack incoming webhooks (detects hooks.slack.com) and generic POST endpoints.
  */
