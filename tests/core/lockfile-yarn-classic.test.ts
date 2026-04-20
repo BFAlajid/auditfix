@@ -109,4 +109,44 @@ git-pkg@^1.0.0:
     expect(graph.has('@scope/pkg@1.2.3')).toBe(true);
     expect(graph.get('@scope/pkg@1.2.3')!.isProduction).toBe(true);
   });
+
+  // C-B4: optionalDependencies must NOT be marked as production.
+  it('does not mark optionalDependencies as production', () => {
+    const content = `
+fsevents@^2.3.0:
+  version "2.3.3"
+  resolved "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz"
+  integrity sha512-fake
+`;
+    const { graph } = parseYarnClassicLockfile(content, {
+      optionalDependencies: { fsevents: '^2.3.0' },
+    });
+    const fsevents = graph.get('fsevents@2.3.3')!;
+    expect(fsevents).toBeDefined();
+    expect(fsevents.isOptional).toBe(true);
+    expect(fsevents.isProduction).toBe(false);
+  });
+
+  // Fix 6: resolveRoot must return null when no entry matches both name AND range.
+  // Previously it fell back to "first entry matching name", which silently
+  // pointed at the wrong version.
+  it('returns null (does not classify) when manifest range does not match any lockfile entry', () => {
+    const content = `
+express@^4.17.1:
+  version "4.17.1"
+  resolved "https://registry.npmjs.org/express/-/express-4.17.1.tgz"
+  integrity sha512-ex
+`;
+    // Manifest declares express@^5.0.0, but lockfile has 4.17.1 under range ^4.17.1.
+    // No exact range match → root resolution fails → express should remain dev
+    // (fallback classification for unreached nodes).
+    const { graph } = parseYarnClassicLockfile(content, {
+      dependencies: { express: '^5.0.0' },
+    });
+    const express = graph.get('express@4.17.1')!;
+    expect(express).toBeDefined();
+    // Because root could not be resolved, express is NOT classified production.
+    expect(express.isProduction).toBe(false);
+    expect(express.isDev).toBe(true);
+  });
 });

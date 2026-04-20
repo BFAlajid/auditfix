@@ -100,6 +100,15 @@ export function parseYarnClassicLockfile(
     graph.set(graphKey, node);
   }
 
+  // P1: build name-index once for fallback lookup (unused here today, but
+  // kept consistent with npm/pnpm/berry — also handed to classifyReachability).
+  const nameIndex = new Map<string, string[]>();
+  for (const [graphKey, node] of graph) {
+    const bucket = nameIndex.get(node.name);
+    if (bucket) bucket.push(graphKey);
+    else nameIndex.set(node.name, [graphKey]);
+  }
+
   // Second pass: resolve dependency edges
   const processed = new Set<string>();
   for (const [requestKey, entry] of Object.entries(entries)) {
@@ -113,26 +122,36 @@ export function parseYarnClassicLockfile(
     const node = graph.get(graphKey);
     if (!node) continue;
 
-    const allDeps = {
-      ...(entry.dependencies ?? {}),
-      ...(entry.optionalDependencies ?? {}),
+    // P7: iterate dependency and optionalDependency records directly (no
+    // spread allocation per package) and dedup via a Set (no per-push O(E)
+    // .includes() scan).
+    const seen = new Set<string>(node.dependencies);
+
+    const pushEdge = (depName: string, depRange: string) => {
+      const depKey = `${depName}@${depRange}`;
+      const depEntry = entries[depKey];
+      if (!depEntry?.version) return;
+      const depGraphKey = `${depName}@${depEntry.version}`;
+      if (graph.has(depGraphKey) && !seen.has(depGraphKey)) {
+        seen.add(depGraphKey);
+        node.dependencies.push(depGraphKey);
+      }
     };
 
-    for (const [depName, _depRange] of Object.entries(allDeps)) {
-      // Find this dep in the entries to get its resolved version
-      const depKey = `${depName}@${_depRange}`;
-      const depEntry = entries[depKey];
-      if (depEntry?.version) {
-        const depGraphKey = `${depName}@${depEntry.version}`;
-        if (graph.has(depGraphKey) && !node.dependencies.includes(depGraphKey)) {
-          node.dependencies.push(depGraphKey);
-        }
+    if (entry.dependencies) {
+      for (const [depName, depRange] of Object.entries(entry.dependencies)) {
+        pushEdge(depName, depRange);
+      }
+    }
+    if (entry.optionalDependencies) {
+      for (const [depName, depRange] of Object.entries(entry.optionalDependencies)) {
+        pushEdge(depName, depRange);
       }
     }
   }
 
   // Reachability pass: classify prod/dev/optional via BFS from package.json roots
-  classifyReachability(graph, entries, manifest);
+  classifyReachability(graph, entries, manifest, nameIndex);
 
   return { graph, skipped };
 }
@@ -162,26 +181,43 @@ function extractNameFromRequestKey(requestKey: string): string | null {
 
 /**
  * BFS from package.json roots to classify production/dev/optional.
+ *
+ * C-B4: optionalDependencies NOT marked isProduction. Optional deps live in
+ * their own classification — the root package.json declaring a dep only in
+ * optionalDependencies should not make that dep (or its transitives)
+ * production-visible to consumers scanning only "what ships to prod".
+ *
+ * Fix 6: resolveRoot returns null when exact-version lookup misses. Never
+ * fall back to "first entry matching name", which previously silently picked
+ * the wrong version and misclassified transitives.
  */
 function classifyReachability(
   graph: DependencyGraph,
   entries: Record<string, YarnLockEntry>,
   manifest: PackageManifest,
+  _nameIndex: Map<string, string[]>,
 ): void {
   const prodRoots = Object.entries(manifest.dependencies ?? {});
   const devRoots = Object.entries(manifest.devDependencies ?? {});
   const optionalRoots = Object.entries(manifest.optionalDependencies ?? {});
 
-  // Resolve root dep names to graph keys
+  // Resolve a manifest root dep (name, range) -> graphKey. Returns null on miss.
   function resolveRoot(name: string, range: string): string | null {
     const entryKey = `${name}@${range}`;
     const entry = entries[entryKey];
     if (entry?.version) {
-      return `${name}@${entry.version}`;
+      const graphKey = `${name}@${entry.version}`;
+      return graph.has(graphKey) ? graphKey : null;
     }
-    // Fallback: search graph for name match
-    for (const [key, node] of graph) {
-      if (node.name === name) return key;
+    // Comma-joined yarn keys: "pkg@^1, pkg@^1.2" — scan entries to see if any
+    // request-key split matches our exact range.
+    for (const [requestKey, e] of Object.entries(entries)) {
+      if (!e?.version) continue;
+      const parts = requestKey.split(',').map((s) => s.trim());
+      if (parts.includes(entryKey)) {
+        const graphKey = `${name}@${e.version}`;
+        return graph.has(graphKey) ? graphKey : null;
+      }
     }
     return null;
   }
@@ -218,17 +254,15 @@ function classifyReachability(
     }
   }
 
-  // Mark production first (takes precedence)
+  // Mark production first (takes precedence over dev/optional)
   bfs(prodRoots, (node) => {
     node.isProduction = true;
   });
 
-  // Mark optional
+  // Mark optional — C-B4: do NOT also set isProduction. Optional deps are
+  // their own category; let consumers decide how to treat them.
   bfs(optionalRoots, (node) => {
     node.isOptional = true;
-    if (!node.isProduction) {
-      node.isProduction = true; // optional deps are still production
-    }
   });
 
   // Mark dev (only if not already production)
