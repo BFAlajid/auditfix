@@ -43,6 +43,28 @@ type PnpmPackageEntry = {
   hasBin?: boolean;
 };
 
+// M-S3: cap pnpm/berry package-key length to defend against 10MB key DOS.
+// 1KB comfortably exceeds real pnpm keys (scope + name + version + peer-dep suffix).
+const MAX_KEY_LENGTH = 1024;
+
+// M-S5: whitelist known pnpm lockfileVersion values. parseFloat previously
+// accepted "Infinity", "9abc", etc. which silently dispatched to the v9 path.
+const SUPPORTED_LOCKFILE_VERSIONS = new Set<string>(['5', '5.0', '5.1', '5.2', '5.3', '5.4', '6', '6.0', '6.1', '9', '9.0']);
+
+function parseLockfileVersion(rawVersion: unknown): number {
+  if (typeof rawVersion === 'number') {
+    if (!Number.isFinite(rawVersion)) return 0;
+    if (rawVersion === 5 || rawVersion === 6 || rawVersion === 9) return rawVersion;
+    return 0;
+  }
+  if (typeof rawVersion !== 'string') return 0;
+  const trimmed = rawVersion.trim();
+  if (!SUPPORTED_LOCKFILE_VERSIONS.has(trimmed)) return 0;
+  // Safe now: whitelist guarantees the string is a clean numeric literal.
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : 0;
+}
+
 export function parsePnpmLockfile(content: string): {
   type: LockfileType;
   graph: DependencyGraph;
@@ -55,17 +77,19 @@ export function parsePnpmLockfile(content: string): {
   }
 
   const rawVersion = lockfile.lockfileVersion;
-  const version = typeof rawVersion === 'string' ? parseFloat(rawVersion) : (rawVersion ?? 0);
+  const version = parseLockfileVersion(rawVersion);
 
   let type: LockfileType;
-  if (version >= 9) {
+  if (version === 9) {
     type = 'pnpm-v9';
-  } else if (version >= 6) {
+  } else if (version === 6) {
     type = 'pnpm-v6';
-  } else if (version >= 5) {
+  } else if (version === 5) {
     type = 'pnpm-v5';
   } else {
-    throw new Error(`Unsupported pnpm lockfile version ${rawVersion}. auditfix requires pnpm lockfileVersion 5+.`);
+    throw new Error(
+      `Unsupported pnpm lockfile version ${JSON.stringify(rawVersion)}. auditfix supports pnpm lockfileVersion 5, 6, or 9.`,
+    );
   }
 
   const packages = lockfile.packages;
@@ -118,6 +142,13 @@ export function parsePnpmLockfile(content: string): {
 
   // First pass: create nodes
   for (const [pkgKey, entry] of Object.entries(packages)) {
+    // M-S3: reject absurdly long keys (DOS vector — repeated 10MB allocations).
+    if (pkgKey.length > MAX_KEY_LENGTH) {
+      logger.warn(`pnpm: skipping oversized package key (${pkgKey.length} bytes, max ${MAX_KEY_LENGTH})`);
+      skipped.push({ key: pkgKey.slice(0, 80) + '...', reason: 'unparseable' });
+      continue;
+    }
+
     const parsed = parsePnpmPackageKey(pkgKey, entry, version);
     if (!parsed) {
       skipped.push({ key: pkgKey, reason: 'unparseable' });
@@ -152,14 +183,40 @@ export function parsePnpmLockfile(content: string): {
 
     const graphKey = `${name}@${pkgVersion}`;
 
-    // pnpm v5/v6 may have explicit dev flag
-    const hasExplicitDev = entry.dev === true;
-    const hasExplicitOptional = entry.optional === true;
+    // C-B1: Respect explicit entry.dev / entry.optional flags from pnpm v5/v6
+    // lockfiles. Fall back to BFS reachability only when flags are absent.
+    const hasDevField = typeof entry.dev === 'boolean';
+    const hasOptionalField = typeof entry.optional === 'boolean';
+    const explicitDev = entry.dev === true;
+    const explicitOptional = entry.optional === true;
 
-    // Classify from root deps
+    // Classify from root deps (monorepo union)
     const isRootProd = prodRootNames.has(name);
     const isRootDev = devRootNames.has(name);
     const isRootOptional = optionalRootNames.has(name);
+    const isRootDep = isRootProd || isRootDev || isRootOptional;
+
+    // Decide prod/dev. Explicit flags beat root-set inference.
+    let isProduction: boolean;
+    let isDev: boolean;
+    if (hasDevField) {
+      // Explicit flag present: trust it unconditionally for this node.
+      // (propagateReachability may still promote transitive prod later.)
+      isDev = explicitDev;
+      isProduction = !explicitDev;
+    } else if (isRootProd) {
+      isProduction = true;
+      isDev = false;
+    } else if (isRootDev) {
+      isProduction = false;
+      isDev = true;
+    } else {
+      // Transitive with no flags: default to dev; reachability BFS promotes.
+      isProduction = false;
+      isDev = true;
+    }
+
+    const isOptional = hasOptionalField ? explicitOptional : isRootOptional;
 
     const node: DependencyNode = {
       name,
@@ -167,17 +224,12 @@ export function parsePnpmLockfile(content: string): {
       resolved: tarball || entry.resolution?.integrity || '',
       integrity: entry.resolution?.integrity ?? '',
       dependencies: [],
-      isProduction: isRootProd || (!hasExplicitDev && !isRootDev),
-      isDev: hasExplicitDev || isRootDev,
-      isOptional: hasExplicitOptional || isRootOptional,
-      depth: isRootProd || isRootDev || isRootOptional ? 1 : 2,
+      isProduction,
+      isDev,
+      isOptional,
+      depth: isRootDep ? 1 : 2,
       dependencyPath: [],
     };
-
-    // Production takes precedence
-    if (node.isProduction) {
-      node.isDev = false;
-    }
 
     const existing = graph.get(graphKey);
     if (existing) {
@@ -190,8 +242,18 @@ export function parsePnpmLockfile(content: string): {
     }
   }
 
+  // P1: build name-index once for O(1) fallback lookup (was O(N) per miss).
+  const nameIndex = new Map<string, string[]>();
+  for (const [graphKey, node] of graph) {
+    const bucket = nameIndex.get(node.name);
+    if (bucket) bucket.push(graphKey);
+    else nameIndex.set(node.name, [graphKey]);
+  }
+
   // Second pass: resolve dependency edges
   for (const [pkgKey, entry] of Object.entries(packages)) {
+    if (pkgKey.length > MAX_KEY_LENGTH) continue;
+
     const parsed = parsePnpmPackageKey(pkgKey, entry, version);
     if (!parsed) continue;
 
@@ -199,26 +261,43 @@ export function parsePnpmLockfile(content: string): {
     const node = graph.get(graphKey);
     if (!node) continue;
 
-    const allDeps = {
-      ...(entry.dependencies ?? {}),
-      ...(entry.optionalDependencies ?? {}),
+    // P7-analogue: iterate both maps directly, Set for dedup.
+    const seen = new Set<string>(node.dependencies);
+
+    const pushEdge = (depName: string, depVersion: string | undefined) => {
+      if (!depVersion) return;
+      const cleanVersion = cleanPnpmVersion(depVersion);
+      if (!cleanVersion) return;
+
+      const directKey = `${depName}@${cleanVersion}`;
+      if (graph.has(directKey)) {
+        if (!seen.has(directKey)) {
+          seen.add(directKey);
+          node.dependencies.push(directKey);
+        }
+        return;
+      }
+
+      // Fallback via name-index (O(1) lookup, O(k) scan where k = same-named versions).
+      const bucket = nameIndex.get(depName);
+      if (!bucket) return;
+      for (const candidate of bucket) {
+        if (!seen.has(candidate)) {
+          seen.add(candidate);
+          node.dependencies.push(candidate);
+          return;
+        }
+      }
     };
 
-    for (const [depName, depVersion] of Object.entries(allDeps)) {
-      const cleanVersion = cleanPnpmVersion(depVersion);
-      if (!cleanVersion) continue;
-
-      const depGraphKey = `${depName}@${cleanVersion}`;
-      if (graph.has(depGraphKey) && !node.dependencies.includes(depGraphKey)) {
-        node.dependencies.push(depGraphKey);
-      } else {
-        // Fallback: find by name
-        for (const [key, n] of graph) {
-          if (n.name === depName && !node.dependencies.includes(key)) {
-            node.dependencies.push(key);
-            break;
-          }
-        }
+    if (entry.dependencies) {
+      for (const [depName, depVersion] of Object.entries(entry.dependencies)) {
+        pushEdge(depName, depVersion);
+      }
+    }
+    if (entry.optionalDependencies) {
+      for (const [depName, depVersion] of Object.entries(entry.optionalDependencies)) {
+        pushEdge(depName, depVersion);
       }
     }
   }
