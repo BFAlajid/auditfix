@@ -2,13 +2,20 @@
  * Lockfile writer.
  * Applies safe updates via package manager-specific override mechanisms:
  * - npm: `overrides` in package.json + `npm install --package-lock-only`
- * - yarn: `resolutions` in package.json + `yarn install`
+ * - yarn Berry: `resolutions` in package.json + `yarn install --mode=update-lockfile`
+ * - yarn Classic: `resolutions` in package.json + `yarn install` (full install — requires approval)
  * - pnpm: `pnpm.overrides` in package.json + `pnpm install --lockfile-only`
  *
  * Security (S3): All shell commands use execFile with argument arrays.
  * Overrides are written via JSON.stringify only — never string interpolation.
+ *
+ * C-B5 fix: overrides are NOT removed after a successful install — they remain in
+ * package.json so the fix is durable. A sentinel file `.auditfix/pending-overrides.json`
+ * records which overrides were just applied, so downstream tooling / humans know the
+ * overrides need to be committed. On install failure we DO restore the original
+ * package.json (rollback).
  */
-import { readFileSync, writeFileSync, existsSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, lstatSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SafeUpdate } from './safe-update.js';
 import type { LockfileType } from '../../types/package.js';
@@ -19,6 +26,10 @@ import * as logger from '../../utils/logger.js';
 export type FixResult = {
   applied: AppliedFix[];
   failed: FailedFix[];
+  /** True when the writer intentionally refused to run (e.g. yarn Classic without --yes). */
+  skipped?: boolean;
+  /** Human-readable explanation when `skipped` is true. */
+  skipReason?: string;
 };
 
 export type AppliedFix = {
@@ -32,12 +43,30 @@ export type FailedFix = {
   reason: string;
 };
 
+export type ApplyFixesOptions = {
+  /** Grant approval for yarn Classic full install. Required because we cannot produce a lockfile-only update there. */
+  yes?: boolean;
+  /** Max bytes allowed for package.json (default 1MB). Oversized files are rejected. */
+  maxPackageJsonBytes?: number;
+};
+
+const DEFAULT_MAX_PACKAGE_JSON_BYTES = 1_048_576; // 1 MB
+
 /**
  * Detect the lockfile type in a project directory.
+ * Distinguishes yarn Classic from yarn Berry by inspecting lockfile content.
  */
 function detectLockfileType(projectDir: string): LockfileType {
   if (existsSync(join(projectDir, 'pnpm-lock.yaml'))) return 'pnpm-v9';
-  if (existsSync(join(projectDir, 'yarn.lock'))) return 'yarn-classic';
+  const yarnPath = join(projectDir, 'yarn.lock');
+  if (existsSync(yarnPath)) {
+    try {
+      const content = readFileSync(yarnPath, 'utf-8');
+      return content.includes('__metadata') ? 'yarn-berry' : 'yarn-classic';
+    } catch {
+      return 'yarn-classic';
+    }
+  }
   return 'npm-v3';
 }
 
@@ -49,6 +78,7 @@ export async function applyFixes(
   projectDir: string,
   updates: SafeUpdate[],
   lockfileType?: LockfileType,
+  options: ApplyFixesOptions = {},
 ): Promise<FixResult> {
   if (updates.length === 0) {
     return { applied: [], failed: [] };
@@ -57,6 +87,7 @@ export async function applyFixes(
   const packageJsonPath = join(projectDir, 'package.json');
   const applied: AppliedFix[] = [];
   const failed: FailedFix[] = [];
+  const maxBytes = options.maxPackageJsonBytes ?? DEFAULT_MAX_PACKAGE_JSON_BYTES;
 
   // Validate all inputs before touching any files
   for (const update of updates) {
@@ -71,13 +102,25 @@ export async function applyFixes(
     }
   }
 
-  // H3: Reject writing to symlinked package.json
+  // H3: Reject writing to symlinked package.json (first check — pre-read)
   try {
     if (lstatSync(packageJsonPath).isSymbolicLink()) {
       failed.push({ packageName: '*', reason: 'Refusing to write to symlinked package.json' });
       return { applied, failed };
     }
   } catch { /* file doesn't exist yet — that's fine, will fail below */ }
+
+  // File size guard — reject oversized package.json before reading.
+  try {
+    const st = statSync(packageJsonPath);
+    if (st.size > maxBytes) {
+      failed.push({
+        packageName: '*',
+        reason: `Refusing to modify oversized package.json (${st.size} bytes > ${maxBytes}).`,
+      });
+      return { applied, failed };
+    }
+  } catch { /* file doesn't exist yet — error will surface on read */ }
 
   // Read original package.json
   let originalContent: string;
@@ -93,6 +136,17 @@ export async function applyFixes(
     return { applied, failed };
   }
 
+  // TOCTOU: re-check that the path hasn't been swapped for a symlink between stat and write.
+  try {
+    if (lstatSync(packageJsonPath).isSymbolicLink()) {
+      failed.push({ packageName: '*', reason: 'Refusing to write to symlinked package.json (TOCTOU)' });
+      return { applied, failed };
+    }
+  } catch {
+    failed.push({ packageName: '*', reason: 'package.json disappeared during apply' });
+    return { applied, failed };
+  }
+
   // Build overrides map
   const overrides: Record<string, string> = {};
   for (const update of updates) {
@@ -102,6 +156,20 @@ export async function applyFixes(
   // Detect package manager strategy
   const type = lockfileType ?? detectLockfileType(projectDir);
   const strategy = getOverrideStrategy(type);
+
+  // Yarn Classic requires approval because there's no --lockfile-only mode.
+  if (type === 'yarn-classic' && !options.yes) {
+    logger.warn(
+      'yarn Classic does not support lockfile-only install. Running full `yarn install` would ' +
+      'mutate node_modules. Re-run with --yes to proceed.',
+    );
+    return {
+      applied: [],
+      failed: [],
+      skipped: true,
+      skipReason: 'yarn-classic requires --yes to run a full install',
+    };
+  }
 
   // Write overrides using the correct strategy
   const existingOverrides = strategy.getExisting(packageJson);
@@ -123,7 +191,8 @@ export async function applyFixes(
       packageName: '*',
       reason: `Failed to write package.json: ${err instanceof Error ? err.message : err}`,
     });
-    writeFileSync(packageJsonPath, originalContent, 'utf-8');
+    // Attempt rollback even on write failure (write may have partially succeeded)
+    try { writeFileSync(packageJsonPath, originalContent, 'utf-8'); } catch { /* ignore */ }
     return { applied, failed };
   }
 
@@ -135,8 +204,10 @@ export async function applyFixes(
   });
 
   if (result.exitCode !== 0) {
+    // Rollback: restore the original package.json so we don't leave overrides
+    // pointing at a broken install state.
     logger.warn(`Install failed (exit ${result.exitCode}): ${result.stderr}`);
-    writeFileSync(packageJsonPath, originalContent, 'utf-8');
+    try { writeFileSync(packageJsonPath, originalContent, 'utf-8'); } catch { /* best effort */ }
 
     for (const update of updates) {
       failed.push({
@@ -157,16 +228,46 @@ export async function applyFixes(
     });
   }
 
-  // Clean up: restore original overrides
-  if (Object.keys(existingOverrides).length > 0) {
-    strategy.setOverrides(packageJson, existingOverrides);
-  } else {
-    strategy.removeOverrides(packageJson);
+  // C-B5 fix: DO NOT restore original overrides on the success path.
+  // Keeping the overrides in package.json is what makes the fix durable across
+  // future `npm install` runs. Write a sentinel so tooling / humans know the
+  // overrides are uncommitted and must be persisted.
+  try {
+    writePendingOverridesSentinel(projectDir, overrides, strategy.name);
+  } catch (err) {
+    logger.warn(
+      `Applied fixes but failed to write pending-overrides sentinel: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
-  writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf-8');
 
   logger.info(`Applied ${applied.length} fixes`);
   return { applied, failed };
+}
+
+/**
+ * Write a sentinel file recording which overrides were just applied by auditfix.
+ * Downstream tooling (review bots, CI) can check for this file to know that
+ * package.json has auditfix-generated overrides that still need to be committed.
+ */
+function writePendingOverridesSentinel(
+  projectDir: string,
+  overrides: Record<string, string>,
+  strategyName: string,
+): void {
+  const sentinelDir = join(projectDir, '.auditfix');
+  if (!existsSync(sentinelDir)) {
+    mkdirSync(sentinelDir, { recursive: true });
+  }
+  const sentinelPath = join(sentinelDir, 'pending-overrides.json');
+  const payload = {
+    schemaVersion: 1,
+    strategy: strategyName,
+    writtenAt: new Date().toISOString(),
+    overrides,
+  };
+  writeFileSync(sentinelPath, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
 }
 
 // --- Override strategies per package manager ---
@@ -186,9 +287,21 @@ function safeGetRecord(value: unknown): Record<string, string> {
 }
 
 function getOverrideStrategy(type: LockfileType): OverrideStrategy {
-  if (type.startsWith('yarn')) {
+  if (type === 'yarn-berry') {
     return {
-      name: 'yarn resolutions',
+      name: 'yarn resolutions (berry)',
+      // Berry supports updating the lockfile without touching node_modules.
+      installCmd: ['yarn', 'install', '--mode=update-lockfile'],
+      getExisting: (pkg) => safeGetRecord(pkg.resolutions),
+      setOverrides: (pkg, overrides) => { pkg.resolutions = overrides; },
+      removeOverrides: (pkg) => { delete pkg.resolutions; },
+    };
+  }
+
+  if (type === 'yarn-classic') {
+    return {
+      name: 'yarn resolutions (classic)',
+      // Classic has no lockfile-only flag. Caller must pass { yes: true } to allow.
       installCmd: ['yarn', 'install'],
       getExisting: (pkg) => safeGetRecord(pkg.resolutions),
       setOverrides: (pkg, overrides) => { pkg.resolutions = overrides; },
