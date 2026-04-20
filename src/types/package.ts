@@ -21,7 +21,9 @@ export type LockfileType =
   | 'yarn-berry'
   | 'pnpm-v5'
   | 'pnpm-v6'
-  | 'pnpm-v9';
+  | 'pnpm-v9'
+  | 'bun'
+  | 'deno';
 
 export type LockfileParseResult = {
   type: LockfileType;
