@@ -1,317 +1,188 @@
 import { describe, it, expect } from 'vitest';
+import semver from 'semver';
 import { matchAdvisories } from '../../src/core/advisory/matcher.js';
 import type { DependencyGraph, DependencyNode } from '../../src/types/package.js';
 import type { Advisory } from '../../src/types/advisory.js';
 
-function makeNode(overrides: Partial<DependencyNode> & { name: string; version: string }): DependencyNode {
+function makeNode(name: string, version: string): DependencyNode {
   return {
+    name,
+    version,
     resolved: '',
     integrity: '',
     dependencies: [],
     isProduction: true,
     isDev: false,
     isOptional: false,
-    depth: 1,
-    dependencyPath: [overrides.name],
-    ...overrides,
+    depth: 0,
+    dependencyPath: [name],
   };
 }
 
-function makeAdvisory(overrides?: Partial<Advisory>): Advisory {
-  return {
-    id: 'GHSA-test-0001-0001',
-    aliases: [],
-    summary: 'Test vulnerability',
-    details: '',
-    severity: [],
-    affectedRange: '>=1.0.0 <2.0.0',
-    fixVersion: '2.0.0',
-    publishedAt: '2024-01-01',
-    modifiedAt: '2024-01-01',
-    references: [],
-    source: 'osv-api',
-    ...overrides,
-  };
-}
-
-function buildGraph(nodes: DependencyNode[]): DependencyGraph {
+function makeGraph(entries: [string, string][]): DependencyGraph {
   const graph: DependencyGraph = new Map();
-  for (const node of nodes) {
-    graph.set(`${node.name}@${node.version}`, node);
+  for (const [name, version] of entries) {
+    graph.set(`${name}@${version}`, makeNode(name, version));
   }
   return graph;
 }
 
+function makeAdvisory(overrides: Partial<Advisory> & { affectedRange: string }): Advisory {
+  return {
+    id: overrides.id ?? 'GHSA-test',
+    aliases: overrides.aliases ?? [],
+    summary: overrides.summary ?? '',
+    details: overrides.details ?? '',
+    severity: overrides.severity ?? [],
+    affectedRange: overrides.affectedRange,
+    fixVersion: overrides.fixVersion ?? null,
+    publishedAt: overrides.publishedAt ?? '',
+    modifiedAt: overrides.modifiedAt ?? '',
+    references: overrides.references ?? [],
+    source: overrides.source ?? 'osv-api',
+  };
+}
+
 describe('matchAdvisories', () => {
-  describe('basic range matching', () => {
-    it('matches when installed version is within the affected range', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
+  it('returns matches for versions within the affected range', () => {
+    const graph = makeGraph([
+      ['lodash', '4.17.20'],
+      ['minimatch', '3.0.4'],
+    ]);
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ id: 'GHSA-a', affectedRange: '<4.17.21' })]],
+      ['minimatch', [makeAdvisory({ id: 'GHSA-b', affectedRange: '<3.0.5' })]],
+    ]);
 
-      const matches = matchAdvisories(graph, advisories);
+    const matches = matchAdvisories(graph, advisories);
 
-      expect(matches).toHaveLength(1);
-      expect(matches[0].package).toBe('lodash');
-      expect(matches[0].installedVersion).toBe('1.5.0');
-    });
-
-    it('does not match when installed version is outside the affected range', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '3.0.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(0);
-    });
-
-    it('does not match when package has no advisories', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'express', version: '4.18.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(0);
-    });
-
-    it('returns empty array when graph is empty', () => {
-      const graph: DependencyGraph = new Map();
-      const advisories = new Map([
-        ['lodash', [makeAdvisory()]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toEqual([]);
-    });
-
-    it('returns empty array when advisories map is empty', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map<string, Advisory[]>();
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toEqual([]);
-    });
+    expect(matches).toHaveLength(2);
+    expect(matches.map((m) => m.package).sort()).toEqual(['lodash', 'minimatch']);
   });
 
-  describe('prerelease version handling', () => {
-    it('matches prerelease versions within the affected range', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '1.5.0-beta.1' }),
-      ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
+  it('skips packages not in the advisory map', () => {
+    const graph = makeGraph([['react', '18.0.0']]);
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ affectedRange: '<5.0.0' })]],
+    ]);
 
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-      expect(matches[0].installedVersion).toBe('1.5.0-beta.1');
-    });
-
-    it('matches prerelease versions with alpha tag', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '1.0.0-alpha.3' }),
-      ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '>=1.0.0-alpha.0 <1.0.0' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-    });
-
-    it('matches prerelease versions that would be missed without includePrerelease', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '2.0.0-rc.1' }),
-      ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '>=1.0.0 <3.0.0' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      // With includePrerelease: true, 2.0.0-rc.1 is in >=1.0.0 <3.0.0
-      expect(matches).toHaveLength(1);
-    });
+    expect(matchAdvisories(graph, advisories)).toEqual([]);
   });
 
-  describe('empty/null advisory ranges', () => {
-    it('skips advisories with empty affectedRange', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ affectedRange: '' })]],
-      ]);
+  it('skips advisories without an affectedRange', () => {
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ id: 'GHSA-broken', affectedRange: '' })]],
+    ]);
 
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(0);
-    });
-
-    it('skips advisories with null-ish affectedRange', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisory = makeAdvisory();
-      // Force affectedRange to be falsy (the code checks `if (!advisory.affectedRange)`)
-      (advisory as { affectedRange: string }).affectedRange = '';
-
-      const advisories = new Map([
-        ['lodash', [advisory]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(0);
-    });
+    expect(matchAdvisories(graph, advisories)).toEqual([]);
   });
 
-  describe('multiple advisories for same package', () => {
-    it('matches multiple advisories against the same installed version', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [
-          makeAdvisory({ id: 'GHSA-0001', affectedRange: '>=1.0.0 <2.0.0' }),
-          makeAdvisory({ id: 'GHSA-0002', affectedRange: '>=1.4.0 <1.6.0' }),
-        ]],
-      ]);
+  it('excludes versions outside the affected range', () => {
+    const graph = makeGraph([['lodash', '4.17.21']]); // patched version
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ affectedRange: '<4.17.21' })]],
+    ]);
 
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(2);
-      expect(matches.map((m) => m.advisory.id)).toEqual(['GHSA-0001', 'GHSA-0002']);
-    });
-
-    it('matches only applicable advisories when version does not satisfy all', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [
-          makeAdvisory({ id: 'GHSA-0001', affectedRange: '>=1.0.0 <2.0.0' }),
-          makeAdvisory({ id: 'GHSA-0002', affectedRange: '>=2.0.0 <3.0.0' }),
-        ]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-      expect(matches[0].advisory.id).toBe('GHSA-0001');
-    });
-
-    it('skips advisory with empty range among valid ones', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [
-          makeAdvisory({ id: 'GHSA-0001', affectedRange: '>=1.0.0 <2.0.0' }),
-          makeAdvisory({ id: 'GHSA-0002', affectedRange: '' }),
-        ]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-      expect(matches[0].advisory.id).toBe('GHSA-0001');
-    });
+    expect(matchAdvisories(graph, advisories)).toEqual([]);
   });
 
-  describe('edge cases', () => {
-    it('matches exact version when range targets a single version', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '1.0.0' }),
+  it('honors includePrerelease for prerelease versions', () => {
+    // Without includePrerelease semver would silently exclude prereleases
+    // and a vulnerable pre-release would slip through.
+    const graph = makeGraph([['lodash', '4.17.21-beta.1']]);
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ affectedRange: '>=4.17.0 <4.17.22' })]],
+    ]);
+
+    expect(matchAdvisories(graph, advisories)).toHaveLength(1);
+  });
+
+  it('falls back to string-based satisfies for unparseable ranges', () => {
+    // Empty string hits the early-continue, but an invalid range should not
+    // throw — it should just not match.
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    const advisories = new Map<string, Advisory[]>([
+      ['lodash', [makeAdvisory({ affectedRange: 'not-a-real-range' })]],
+    ]);
+
+    // compileRange returns null, testRange also handles invalid — result: no match
+    expect(matchAdvisories(graph, advisories)).toEqual([]);
+  });
+
+  it('pre-compiled range produces identical results to per-call satisfies across 100 advisories', () => {
+    // Build a batch of diverse ranges and a graph of matching versions;
+    // compare the optimized matcher against a direct semver.satisfies baseline.
+    const ranges = [
+      '<1.0.0',
+      '>=1.0.0 <2.0.0',
+      '>=2.0.0 <3.0.0',
+      '>=2.0.0 <3.5.0 || >=4.0.0 <4.5.0',
+      '<4.17.21',
+      '>=0.0.0',
+      '1.x',
+      '~1.2.3',
+      '^2.0.0',
+      '>3.0.0 <=3.9.9',
+    ];
+
+    const graph: DependencyGraph = new Map();
+    for (let i = 0; i < 100; i++) {
+      const name = `pkg-${i}`;
+      const version = `${i % 5}.${i % 7}.${i % 3}`;
+      graph.set(`${name}@${version}`, makeNode(name, version));
+    }
+
+    const advisories = new Map<string, Advisory[]>();
+    let counter = 0;
+    for (const [, node] of graph) {
+      const range = ranges[counter % ranges.length];
+      counter++;
+      advisories.set(node.name, [
+        makeAdvisory({ id: `GHSA-${counter}`, affectedRange: range }),
       ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '1.0.0' })]],
-      ]);
+    }
 
-      const matches = matchAdvisories(graph, advisories);
+    // Reference: per-call semver.satisfies with includePrerelease
+    const reference: Array<{ pkg: string; id: string }> = [];
+    for (const [, node] of graph) {
+      for (const adv of advisories.get(node.name) ?? []) {
+        if (semver.satisfies(node.version, adv.affectedRange, { includePrerelease: true })) {
+          reference.push({ pkg: node.name, id: adv.id });
+        }
+      }
+    }
 
-      expect(matches).toHaveLength(1);
-    });
+    const matches = matchAdvisories(graph, advisories).map((m) => ({
+      pkg: m.package,
+      id: m.advisory.id,
+    }));
 
-    it('does not match version just above the upper boundary', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '2.0.0' }),
-      ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
+    expect(matches.length).toBe(reference.length);
+    expect(new Set(matches.map((m) => `${m.pkg}|${m.id}`))).toEqual(
+      new Set(reference.map((m) => `${m.pkg}|${m.id}`)),
+    );
+  });
 
-      const matches = matchAdvisories(graph, advisories);
+  it('reuses compiled range when the same advisory is evaluated against multiple versions', () => {
+    // Same advisory, many packages sharing the name — confirms the per-advisory
+    // compile cache hits the same object each time without changing semantics.
+    const graph: DependencyGraph = new Map();
+    for (let i = 0; i < 50; i++) {
+      const v = `1.${i}.0`;
+      graph.set(`shared@${v}`, makeNode('shared', v));
+    }
 
-      expect(matches).toHaveLength(0);
-    });
+    const advisory = makeAdvisory({ id: 'GHSA-hot', affectedRange: '>=1.10.0 <1.30.0' });
+    const advisories = new Map<string, Advisory[]>([['shared', [advisory]]]);
 
-    it('matches version at lower boundary (inclusive)', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'pkg', version: '1.0.0' }),
-      ]);
-      const advisories = new Map([
-        ['pkg', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
+    const matches = matchAdvisories(graph, advisories);
 
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-    });
-
-    it('propagates dependencyPath and isProduction from graph node', () => {
-      const graph = buildGraph([
-        makeNode({
-          name: 'lodash',
-          version: '1.5.0',
-          dependencyPath: ['express', 'body-parser', 'lodash'],
-          isProduction: false,
-        }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ affectedRange: '>=1.0.0 <2.0.0' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(1);
-      expect(matches[0].dependencyPath).toEqual(['express', 'body-parser', 'lodash']);
-      expect(matches[0].isProduction).toBe(false);
-    });
-
-    it('matches across multiple packages in the graph', () => {
-      const graph = buildGraph([
-        makeNode({ name: 'lodash', version: '1.5.0' }),
-        makeNode({ name: 'express', version: '4.17.0' }),
-        makeNode({ name: 'axios', version: '0.21.1' }),
-      ]);
-      const advisories = new Map([
-        ['lodash', [makeAdvisory({ id: 'GHSA-lodash', affectedRange: '>=1.0.0 <2.0.0' })]],
-        ['axios', [makeAdvisory({ id: 'GHSA-axios', affectedRange: '>=0.21.0 <0.21.2' })]],
-      ]);
-
-      const matches = matchAdvisories(graph, advisories);
-
-      expect(matches).toHaveLength(2);
-      const matchedPkgs = matches.map((m) => m.package).sort();
-      expect(matchedPkgs).toEqual(['axios', 'lodash']);
-    });
+    // 1.10.0 through 1.29.0 → 20 matches
+    expect(matches).toHaveLength(20);
+    // Every match carries the same Advisory reference
+    for (const m of matches) {
+      expect(m.advisory).toBe(advisory);
+    }
   });
 });

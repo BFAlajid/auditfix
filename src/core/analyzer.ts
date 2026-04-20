@@ -58,6 +58,9 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
   try {
     const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache });
     advisories = resolved.advisories;
+    // TODO(resolver-sourceId): prefer `resolved.sourceId` for any downstream
+    // logic that needs to branch on origin (telemetry, confidence rules, etc.).
+    // The `source` string is retained for human-readable display only.
     advisorySource = resolved.source;
     confidence = resolved.confidence;
     advisoryCount = countAdvisories(advisories);

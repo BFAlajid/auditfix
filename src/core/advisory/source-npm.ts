@@ -238,8 +238,14 @@ export async function fetchNpmAdvisories(
     const pkgName = npmAdvisory.module_name;
     if (!pkgName) continue;
 
+    // Include module_name in the key — the numeric `id` field is only unique
+    // within a package, so two different packages can share the same id and
+    // collide downstream if we keyed solely on it.
     const advisory: Advisory = {
-      id: npmAdvisory.id != null ? `npm-${npmAdvisory.id}` : 'npm-unknown',
+      id:
+        npmAdvisory.id != null
+          ? `npm-${pkgName}-${npmAdvisory.id}`
+          : `npm-${pkgName}-unknown`,
       aliases: npmAdvisory.cves ?? [],
       summary: npmAdvisory.title ?? '',
       details: npmAdvisory.overview ?? '',

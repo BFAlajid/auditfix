@@ -19,6 +19,7 @@ import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import type { Advisory } from '../../types/advisory.js';
 import { isValidAdvisoryId, safeJsonParse } from '../../utils/sanitize.js';
+import * as logger from '../../utils/logger.js';
 
 const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const CACHE_FRESH_MS = 1 * 60 * 60 * 1000; // 1 hour — serve without refresh
@@ -285,6 +286,10 @@ export function getCachedAdvisory(
 /**
  * Cache a batch of advisories keyed by package name.
  * Skips packages with empty advisory arrays (never cache negative results).
+ *
+ * Individual write failures (disk full, permissions, symlink rejection) are
+ * logged and skipped — one bad entry must not abort the entire batch, since
+ * the caller treats this as best-effort background work.
  */
 export async function cacheAdvisoryBatch(
   advisories: Map<string, Advisory[]>,
@@ -302,12 +307,18 @@ export async function cacheAdvisoryBatch(
     const filePath = buildPackagePath(packageName, cacheDir);
     if (!filePath) continue;
 
-    const timestamp = Date.now();
-    const payload = JSON.stringify(advisoryList) + '|' + String(timestamp);
-    const hmac = computeHmac(payload, hmacKey);
+    try {
+      const timestamp = Date.now();
+      const payload = JSON.stringify(advisoryList) + '|' + String(timestamp);
+      const hmac = computeHmac(payload, hmacKey);
 
-    const entry: CacheEntry = { data: advisoryList, timestamp, hmac };
-    atomicWrite(filePath, JSON.stringify(entry));
+      const entry: CacheEntry = { data: advisoryList, timestamp, hmac };
+      atomicWrite(filePath, JSON.stringify(entry));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.debug(`Cache write failed for package "${packageName}": ${msg}`);
+      // continue — do not abort the batch on a single failure
+    }
   }
 }
 

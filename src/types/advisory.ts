@@ -74,3 +74,16 @@ export type AdvisoryMatch = {
   workspaces?: string[]; // workspace names that use this package
   isDirectlyImported?: boolean; // true if application source code imports this package
 };
+
+/**
+ * Structured discriminator for resolver result origin.
+ * Use for programmatic branching / telemetry; the human-readable string lives
+ * on `ResolverResult.source`.
+ */
+export type ResolverSourceId =
+  | 'osv'
+  | 'osv-partial'
+  | 'cache'
+  | 'cache-stale'
+  | 'offline'
+  | 'npm-bulk';
