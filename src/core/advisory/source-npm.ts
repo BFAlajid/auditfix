@@ -10,9 +10,16 @@ import type { DependencyGraph } from '../../types/package.js';
 import type { Advisory } from '../../types/advisory.js';
 import { safeJsonParse } from '../../utils/sanitize.js';
 import * as logger from '../../utils/logger.js';
+import {
+  defaultNpmrcConfig,
+  registryForPackage,
+  tokenForRegistry,
+  type NpmrcConfig,
+} from '../../utils/npmrc.js';
 
-const NPM_BULK_URL =
-  'https://registry.npmjs.org/-/npm/v1/security/advisories/bulk';
+const DEFAULT_REGISTRY = 'https://registry.npmjs.org/';
+const NPM_BULK_PATH = '-/npm/v1/security/advisories/bulk';
+const NPM_BULK_URL = `${DEFAULT_REGISTRY}${NPM_BULK_PATH}`;
 const MAX_RESPONSE_SIZE = 50 * 1024 * 1024; // 50MB
 
 export type NpmFetchResult = {
@@ -132,28 +139,108 @@ function buildRequestBody(
 }
 
 /**
+ * Partition a bulk-request body into per-registry sub-bodies based on
+ * scope-to-registry routing from the supplied npmrc config.
+ *
+ * Packages with no scope override go to the default registry.
+ */
+function partitionByRegistry(
+  body: Record<string, string[]>,
+  config: NpmrcConfig
+): Map<string, Record<string, string[]>> {
+  const byRegistry = new Map<string, Record<string, string[]>>();
+
+  for (const [name, versions] of Object.entries(body)) {
+    const registry = registryForPackage(name, config);
+    const bucket = byRegistry.get(registry) ?? {};
+    bucket[name] = versions;
+    byRegistry.set(registry, bucket);
+  }
+  return byRegistry;
+}
+
+/** Join a registry base URL with the bulk advisories path. */
+function bulkUrlFor(registry: string): string {
+  const base = registry.endsWith('/') ? registry : `${registry}/`;
+  return `${base}${NPM_BULK_PATH}`;
+}
+
+export type FetchNpmOptions = {
+  /** Pre-loaded .npmrc config. Default: public registry, no auth. */
+  npmrc?: NpmrcConfig;
+};
+
+/**
  * Fetch advisories for all packages in the dependency graph via the npm
  * bulk advisory endpoint.
+ *
+ * When `options.npmrc` is provided, packages are partitioned by their
+ * configured registry and each registry gets its own request with the
+ * matching auth token.
  */
 export async function fetchNpmAdvisories(
-  graph: DependencyGraph
+  graph: DependencyGraph,
+  options: FetchNpmOptions = {}
 ): Promise<NpmFetchResult> {
   const errors: string[] = [];
+  const advisories = new Map<string, Advisory[]>();
 
   if (graph.size === 0) {
-    return { advisories: new Map(), errors };
+    return { advisories, errors };
   }
 
   const body = buildRequestBody(graph);
   if (!body) {
-    return { advisories: new Map(), errors };
+    return { advisories, errors };
+  }
+
+  const npmrc = options.npmrc ?? defaultNpmrcConfig();
+  const buckets = partitionByRegistry(body, npmrc);
+
+  // Preserve legacy URL for the public registry so the default path
+  // continues to look identical in tests and traces.
+  for (const [registry, subBody] of buckets) {
+    const url =
+      registry === DEFAULT_REGISTRY ? NPM_BULK_URL : bulkUrlFor(registry);
+    const token = tokenForRegistry(registry, npmrc);
+    const fetched = await fetchOneBulk(url, subBody, token, errors);
+    for (const [pkg, list] of fetched) {
+      const existing = advisories.get(pkg) ?? [];
+      existing.push(...list);
+      advisories.set(pkg, existing);
+    }
+  }
+
+  logger.debug(
+    `npm bulk returned ${advisories.size} affected packages with advisories`
+  );
+
+  return { advisories, errors };
+}
+
+/**
+ * Perform a single bulk-advisory request against one registry. Push errors
+ * onto the caller's array so partial failures don't abort other registries.
+ */
+async function fetchOneBulk(
+  url: string,
+  body: Record<string, string[]>,
+  token: string | null,
+  errors: string[]
+): Promise<Map<string, Advisory[]>> {
+  const advisories = new Map<string, Advisory[]>();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
   }
 
   let response: Response;
   try {
-    response = await fetch(NPM_BULK_URL, {
+    response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });
@@ -161,13 +248,13 @@ export async function fetchNpmAdvisories(
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`npm bulk request failed: ${msg}`);
     logger.warn(`npm bulk request failed: ${msg}`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
   if (!response.ok) {
     errors.push(`npm bulk HTTP ${response.status}: ${response.statusText}`);
     logger.warn(`npm bulk HTTP ${response.status}: ${response.statusText}`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
   // Validate Content-Type before parsing (S5: npm outages return HTML)
@@ -179,20 +266,18 @@ export async function fetchNpmAdvisories(
     logger.warn(
       `npm bulk unexpected Content-Type: ${contentType}. Expected application/json.`
     );
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
-  // Check Content-Length if available
   const contentLength = response.headers.get('content-length');
   if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_SIZE) {
     errors.push(
       `npm bulk response too large: ${contentLength} bytes (max ${MAX_RESPONSE_SIZE})`
     );
     logger.warn(`npm bulk response too large: ${contentLength} bytes`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
-  // Read body as text (to guard against oversized responses and HTML)
   let text: string;
   try {
     text = await response.text();
@@ -200,7 +285,7 @@ export async function fetchNpmAdvisories(
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`npm bulk failed to read response body: ${msg}`);
     logger.warn(`npm bulk failed to read body: ${msg}`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
   if (text.length > MAX_RESPONSE_SIZE) {
@@ -208,29 +293,25 @@ export async function fetchNpmAdvisories(
       `npm bulk response body too large: ${text.length} chars (max ${MAX_RESPONSE_SIZE})`
     );
     logger.warn(`npm bulk response body too large: ${text.length} chars`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
-  // Parse JSON — npm outages may return HTML with 200 status
   let parsed: NpmBulkResponse;
   try {
     parsed = safeJsonParse<NpmBulkResponse>(text);
-  } catch (err) {
+  } catch {
     const preview = text.slice(0, 200);
     errors.push(
       `npm bulk response is not valid JSON (possible outage). Preview: ${preview}`
     );
     logger.warn(`npm bulk response is not valid JSON. Preview: ${preview}`);
-    return { advisories: new Map(), errors };
+    return advisories;
   }
 
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     errors.push('npm bulk response is not an object');
-    return { advisories: new Map(), errors };
+    return advisories;
   }
-
-  // Convert npm advisories to our Advisory type
-  const advisories = new Map<string, Advisory[]>();
 
   for (const [, npmAdvisory] of Object.entries(parsed)) {
     if (!npmAdvisory || typeof npmAdvisory !== 'object') continue;
@@ -265,9 +346,5 @@ export async function fetchNpmAdvisories(
     advisories.set(pkgName, existing);
   }
 
-  logger.debug(
-    `npm bulk returned ${advisories.size} affected packages with advisories`
-  );
-
-  return { advisories, errors };
+  return advisories;
 }

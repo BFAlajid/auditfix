@@ -51,6 +51,24 @@ export type OsvBatchResponse = {
   }[];
 };
 
+export type CweRef = {
+  id: string; // e.g. "CWE-79"
+  name: string;
+};
+
+export type CvssDetails = {
+  score: number;
+  vectorString: string;
+};
+
+export type AdvisorySourceId =
+  | 'osv-api'
+  | 'bundled-index'
+  | 'npm-bulk'
+  | 'cache'
+  | 'offline-index'
+  | 'ghsa';
+
 export type Advisory = {
   id: string;
   aliases: string[];
@@ -62,7 +80,11 @@ export type Advisory = {
   publishedAt: string;
   modifiedAt: string;
   references: { type: string; url: string }[];
-  source: 'osv-api' | 'bundled-index' | 'npm-bulk' | 'cache' | 'offline-index';
+  source: AdvisorySourceId;
+  /** Optional CWE classifications enriched from GHSA. */
+  cwes?: CweRef[];
+  /** Optional parsed CVSS details (enriched from GHSA). */
+  cvss?: CvssDetails;
 };
 
 export type AdvisoryMatch = {

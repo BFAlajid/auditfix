@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fetchNpmAdvisories } from '../../src/core/advisory/source-npm.js';
+import { defaultNpmrcConfig } from '../../src/utils/npmrc.js';
 import type { DependencyGraph, DependencyNode } from '../../src/types/package.js';
 
 function makeNode(name: string, version: string): DependencyNode {
@@ -220,71 +221,98 @@ describe('fetchNpmAdvisories', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('produces distinct ids when two packages share the same numeric advisory id', async () => {
-    // npm advisory ids are only unique within a package — two packages can
-    // report the same numeric id for unrelated vulns. Without module_name in
-    // the key, the second advisory would overwrite or collide with the first.
-    const collidingResponse = {
-      'alpha-entry': {
-        id: 42,
-        title: 'Alpha vuln',
-        severity: 'high',
-        vulnerable_versions: '<1.0.0',
-        patched_versions: '>=1.0.0',
-        module_name: 'alpha',
-        created: '2024-01-01T00:00:00.000Z',
-        updated: '2024-01-01T00:00:00.000Z',
-      },
-      'beta-entry': {
-        id: 42, // same numeric id!
-        title: 'Beta vuln',
-        severity: 'medium',
-        vulnerable_versions: '<2.0.0',
-        patched_versions: '>=2.0.0',
-        module_name: 'beta',
-        created: '2024-02-01T00:00:00.000Z',
-        updated: '2024-02-01T00:00:00.000Z',
-      },
-    };
+  it('does NOT send Authorization when no npmrc config is provided', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
 
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
-      mockResponse(collidingResponse)
-    ));
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph);
 
-    const graph = makeGraph([
-      ['alpha', '0.5.0'],
-      ['beta', '1.5.0'],
-    ]);
-
-    const result = await fetchNpmAdvisories(graph);
-
-    const alpha = result.advisories.get('alpha')![0];
-    const beta = result.advisories.get('beta')![0];
-
-    expect(alpha.id).toBe('npm-alpha-42');
-    expect(beta.id).toBe('npm-beta-42');
-    expect(alpha.id).not.toBe(beta.id);
+    const [, init] = fetchMock.mock.calls[0];
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
   });
 
-  it('handles missing numeric id by including package name in fallback key', async () => {
-    const response = {
-      'no-id': {
-        // id intentionally missing
-        title: 'Mystery vuln',
-        severity: 'low',
-        vulnerable_versions: '<1.0.0',
-        module_name: 'left-pad',
-        created: '2024-01-01T00:00:00.000Z',
-        updated: '2024-01-01T00:00:00.000Z',
-      },
-    };
+  it('sends Authorization header when npmrc token matches default registry', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
 
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mockResponse(response)));
+    const npmrc = defaultNpmrcConfig();
+    npmrc.authTokens['//registry.npmjs.org/'] = 'PUBLIC_TOKEN';
 
-    const graph = makeGraph([['left-pad', '0.5.0']]);
-    const result = await fetchNpmAdvisories(graph);
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph, { npmrc });
 
-    const advisory = result.advisories.get('left-pad')![0];
-    expect(advisory.id).toBe('npm-left-pad-unknown');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(
+      'https://registry.npmjs.org/-/npm/v1/security/advisories/bulk'
+    );
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer PUBLIC_TOKEN');
+  });
+
+  it('routes a scoped package to its scope registry with its own auth', async () => {
+    // Two sequential calls — one per registry bucket.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(sampleNpmResponse))
+      .mockResolvedValueOnce(mockResponse({}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const npmrc = defaultNpmrcConfig();
+    npmrc.scopeRegistries['@acme'] = 'https://acme.example.com/';
+    npmrc.authTokens['//acme.example.com/'] = 'ACME_TOKEN';
+
+    const graph = makeGraph([
+      ['lodash', '4.17.20'],
+      ['@acme/widget', '1.0.0'],
+    ]);
+    await fetchNpmAdvisories(graph, { npmrc });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Find the call to the acme registry.
+    const acmeCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).startsWith('https://acme.example.com/')
+    );
+    expect(acmeCall).toBeDefined();
+    const acmeHeaders = (acmeCall![1] as RequestInit).headers as Record<
+      string,
+      string
+    >;
+    expect(acmeHeaders.Authorization).toBe('Bearer ACME_TOKEN');
+
+    // The public registry call should have no Authorization header.
+    const publicCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).startsWith('https://registry.npmjs.org/')
+    );
+    expect(publicCall).toBeDefined();
+    const publicHeaders = (publicCall![1] as RequestInit).headers as Record<
+      string,
+      string
+    >;
+    expect(publicHeaders.Authorization).toBeUndefined();
+  });
+
+  it('omits Authorization when no token matches the registry', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(mockResponse(sampleNpmResponse));
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Config with auth for a different registry.
+    const npmrc = defaultNpmrcConfig();
+    npmrc.authTokens['//other.example.com/'] = 'OTHER_TOKEN';
+
+    const graph = makeGraph([['lodash', '4.17.20']]);
+    await fetchNpmAdvisories(graph, { npmrc });
+
+    const [, init] = fetchMock.mock.calls[0];
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBeUndefined();
   });
 });

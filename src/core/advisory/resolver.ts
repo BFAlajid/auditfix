@@ -13,6 +13,7 @@ import type { Advisory, ResolverSourceId } from '../../types/advisory.js';
 import type { ConfidenceLevel } from '../../types/report.js';
 import { fetchOsvAdvisories } from './source-osv.js';
 import { fetchNpmAdvisories } from './source-npm.js';
+import { fetchGhsaAdvisories } from './source-ghsa.js';
 import {
   cacheAdvisoryBatch,
   getCachedPackageAdvisories,
@@ -41,35 +42,108 @@ export type ResolverResult = {
   errors: string[];
 };
 
-const SOURCE_LABELS: Record<ResolverSourceId, string> = {
-  'osv': 'OSV.dev API (real-time)',
-  'osv-partial': 'OSV.dev API (partial)',
-  'cache': 'Local cache',
-  'cache-stale': 'Local cache (stale)',
-  'offline': 'Bundled offline index',
-  'npm-bulk': 'npm bulk advisory endpoint',
+export type ResolveAdvisoriesOptions = {
+  /**
+   * Optional GitHub token. When present, GHSA GraphQL is called as an
+   * enrichment step to merge CWE + CVSS fields into existing advisories.
+   * Falls back silently to GITHUB_TOKEN / GH_TOKEN env vars.
+   */
+  ghsaToken?: string;
 };
 
-function buildResult(
-  advisories: Map<string, Advisory[]>,
-  sourceId: ResolverSourceId,
-  confidence: ConfidenceLevel,
-  errors: string[],
-): ResolverResult {
-  return {
-    advisories,
-    source: SOURCE_LABELS[sourceId],
-    sourceId,
-    confidence,
-    errors,
-  };
+/** Resolve the GHSA token from options or common env-var fallbacks. */
+function resolveGhsaToken(options: ResolveAdvisoriesOptions): string {
+  if (options.ghsaToken && options.ghsaToken.length > 0) {
+    return options.ghsaToken;
+  }
+  return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? '';
+}
+
+/**
+ * Overlay GHSA enrichment data onto existing advisories. Matches by GHSA id
+ * in advisory id or aliases; copies cwes, cvss, and an upgraded CVSS vector
+ * when available. Never removes or replaces primary advisories.
+ */
+async function enrichWithGhsa(
+  result: ResolverResult,
+  token: string
+): Promise<void> {
+  if (!token || result.advisories.size === 0) return;
+
+  const packageNames = Array.from(result.advisories.keys());
+  let ghsaMap: Map<string, Advisory[]>;
+  try {
+    ghsaMap = await fetchGhsaAdvisories({ token, packages: packageNames });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`GHSA enrichment skipped (non-fatal): ${msg}`);
+    return;
+  }
+  if (ghsaMap.size === 0) return;
+
+  let enrichedCount = 0;
+
+  for (const [pkg, existingList] of result.advisories) {
+    const ghsaForPkg = ghsaMap.get(pkg);
+    if (!ghsaForPkg || ghsaForPkg.length === 0) continue;
+
+    // Build a fast lookup by GHSA id.
+    const byId = new Map<string, Advisory>();
+    for (const g of ghsaForPkg) {
+      byId.set(g.id, g);
+    }
+
+    for (const advisory of existingList) {
+      const match = findGhsaMatch(advisory, byId);
+      if (!match) continue;
+
+      if (match.cwes && match.cwes.length > 0) {
+        advisory.cwes = match.cwes;
+      }
+      if (match.cvss) {
+        advisory.cvss = match.cvss;
+        // Prefer GHSA's CVSS vector if the advisory lacks one.
+        if (advisory.severity.length === 0 && match.cvss.vectorString) {
+          advisory.severity = [
+            { type: 'CVSS_V3', score: match.cvss.vectorString },
+          ];
+        }
+      }
+      enrichedCount++;
+    }
+  }
+
+  if (enrichedCount > 0) {
+    logger.info(`GHSA enrichment added metadata to ${enrichedCount} advisories`);
+  }
+}
+
+/** Find a GHSA advisory matching `advisory` by id or alias. */
+function findGhsaMatch(
+  advisory: Advisory,
+  byId: Map<string, Advisory>
+): Advisory | null {
+  if (byId.has(advisory.id)) return byId.get(advisory.id) ?? null;
+  for (const alias of advisory.aliases) {
+    if (byId.has(alias)) return byId.get(alias) ?? null;
+  }
+  return null;
 }
 
 /**
  * Resolve advisories using the three-tier fallback chain.
+ *
+ * When `options.ghsaToken` (or GITHUB_TOKEN / GH_TOKEN env vars) is present,
+ * GHSA GraphQL is called after the primary source to enrich advisories with
+ * CWE classifications and CVSS metadata. GHSA failures never degrade the
+ * scan — enrichment only.
  */
-export async function resolveAdvisories(graph: DependencyGraph): Promise<ResolverResult> {
+export async function resolveAdvisories(
+  graph: DependencyGraph,
+  options: ResolveAdvisoriesOptions = {}
+): Promise<ResolverResult> {
   const errors: string[] = [];
+  const ghsaToken = resolveGhsaToken(options);
 
   // Tier 1: OSV batch API
   logger.info('Fetching advisories from OSV.dev...');
@@ -82,7 +156,14 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
         logger.debug(`Cache write failed: ${err}`);
       });
 
-      return buildResult(osvResult.advisories, 'osv', 'HIGH', []);
+      const result: ResolverResult = {
+        advisories: osvResult.advisories,
+        source: 'OSV.dev API (real-time)',
+        confidence: 'HIGH',
+        errors: [],
+      };
+      await enrichWithGhsa(result, ghsaToken);
+      return result;
     }
 
     // OSV had errors but returned some data — use it with reduced confidence
@@ -90,12 +171,14 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
       errors.push(...osvResult.errors);
       cacheAdvisoryBatch(osvResult.advisories).catch(() => {});
 
-      return buildResult(
-        osvResult.advisories,
-        'osv-partial',
-        'MEDIUM',
+      const result: ResolverResult = {
+        advisories: osvResult.advisories,
+        source: 'OSV.dev API (partial)',
+        confidence: 'MEDIUM',
         errors,
-      );
+      };
+      await enrichWithGhsa(result, ghsaToken);
+      return result;
     }
 
     errors.push(...osvResult.errors);
@@ -110,7 +193,14 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
   const cachedAdvisories = getCachedAdvisoriesForGraph(graph);
   if (cachedAdvisories.size > 0) {
     logger.info(`Using ${cachedAdvisories.size} cached advisory entries`);
-    return buildResult(cachedAdvisories, 'cache', 'MEDIUM', errors);
+    const result: ResolverResult = {
+      advisories: cachedAdvisories,
+      source: 'Local cache',
+      confidence: 'MEDIUM',
+      errors,
+    };
+    await enrichWithGhsa(result, ghsaToken);
+    return result;
   }
 
   // Tier 3: Bundled offline index
@@ -118,7 +208,14 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
   const offlineAdvisories = await queryOfflineIndexBatch(graph);
   if (offlineAdvisories.size > 0) {
     logger.info(`Using ${offlineAdvisories.size} entries from offline index`);
-    return buildResult(offlineAdvisories, 'offline', 'LOW', errors);
+    const result: ResolverResult = {
+      advisories: offlineAdvisories,
+      source: 'Bundled offline index',
+      confidence: 'LOW',
+      errors,
+    };
+    await enrichWithGhsa(result, ghsaToken);
+    return result;
   }
 
   // Tier 4: npm bulk advisory endpoint
@@ -131,12 +228,14 @@ export async function resolveAdvisories(graph: DependencyGraph): Promise<Resolve
       cacheAdvisoryBatch(npmResult.advisories).catch(() => {});
 
       errors.push(...npmResult.errors);
-      return buildResult(
-        npmResult.advisories,
-        'npm-bulk',
-        npmResult.errors.length > 0 ? 'LOW' : 'MEDIUM',
+      const result: ResolverResult = {
+        advisories: npmResult.advisories,
+        source: 'npm bulk advisory endpoint',
+        confidence: npmResult.errors.length > 0 ? 'LOW' : 'MEDIUM',
         errors,
-      );
+      };
+      await enrichWithGhsa(result, ghsaToken);
+      return result;
     }
 
     errors.push(...npmResult.errors);
