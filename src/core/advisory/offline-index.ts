@@ -11,6 +11,9 @@
 import type { Advisory } from '../../types/advisory.js';
 import semver from 'semver';
 import * as logger from '../../utils/logger.js';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export type OfflineEntry = {
   id: string;
@@ -46,8 +49,16 @@ function isModuleNotFound(err: unknown): boolean {
 type GeneratedIndexLoader = () => Promise<OfflineEntry[] | null>;
 
 const defaultLoader: GeneratedIndexLoader = async () => {
-  // @ts-expect-error — generated file may not exist; handled by caller
-  const mod = await import('./offline-index.generated.js');
+  // Build the path dynamically so bundlers don't try to statically resolve
+  // an optional file that may not exist at build time.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const genPath = path.join(here, 'offline-index.generated.js');
+  if (!existsSync(genPath)) {
+    const err = new Error(`generated index not present at ${genPath}`) as Error & { code?: string };
+    err.code = 'ERR_MODULE_NOT_FOUND';
+    throw err;
+  }
+  const mod = await import(pathToFileURL(genPath).href);
   if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
     return mod.GENERATED_INDEX as OfflineEntry[];
   }

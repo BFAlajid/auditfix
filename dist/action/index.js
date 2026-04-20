@@ -4611,11 +4611,30 @@ var MAL_RE = /^MAL-\d{4}-\d+$/;
 function isValidAdvisoryId(id) {
   return GHSA_RE.test(id) || CVE_RE.test(id) || MAL_RE.test(id) || id.startsWith("PYSEC-") || id.startsWith("RUSTSEC-");
 }
+function stripProtoKeys(value, seen = /* @__PURE__ */ new WeakSet()) {
+  if (value === null || typeof value !== "object") return value;
+  const node = value;
+  if (seen.has(node)) return value;
+  seen.add(node);
+  if (Array.isArray(value)) {
+    for (const item of value) stripProtoKeys(item, seen);
+    return value;
+  }
+  for (const key of Object.keys(value)) {
+    if (DANGEROUS_KEYS.has(key)) {
+      delete value[key];
+      continue;
+    }
+    stripProtoKeys(value[key], seen);
+  }
+  return value;
+}
 function safeYamlParse(content) {
-  return jsYaml.load(stripBom(content), {
+  const parsed = jsYaml.load(stripBom(content), {
     schema: jsYaml.DEFAULT_SCHEMA,
     json: true
   });
+  return stripProtoKeys(parsed);
 }
 
 // src/utils/semver.ts
@@ -4630,6 +4649,21 @@ function satisfies(version, range) {
   if (!isValidVersion(version)) return false;
   try {
     return import_semver.default.satisfies(version, range, PRERELEASE_OPTS);
+  } catch {
+    return false;
+  }
+}
+function compileRange(range) {
+  try {
+    return new import_semver.default.Range(range, PRERELEASE_OPTS);
+  } catch {
+    return null;
+  }
+}
+function testRange(version, range) {
+  if (!isValidVersion(version)) return false;
+  try {
+    return range.test(version);
   } catch {
     return false;
   }
@@ -4676,6 +4710,10 @@ function parseNpmLockfile(content) {
       continue;
     }
     const name = entry.name ?? extractPackageName(pathKey);
+    if (name && (name.includes("..") || name.includes("\0") || name.includes("\\"))) {
+      skipped.push({ key: pathKey, reason: "invalid-name" });
+      continue;
+    }
     if (!isValidVersion(version)) {
       skipped.push({ key: pathKey, reason: "unparseable" });
       continue;
@@ -4745,18 +4783,27 @@ function countDepth(pathKey) {
 }
 function findResolvedDep(graph, nameIndex, name, range) {
   const candidates = nameIndex.get(name);
-  if (!candidates) return null;
-  let fallback = null;
+  if (!candidates || candidates.length === 0) return null;
   for (const key of candidates) {
     const node = graph.get(key);
+    if (!node) continue;
     if (satisfiesRange(node.version, range)) {
       return key;
     }
-    if (!fallback) {
-      fallback = key;
-    }
   }
-  return fallback;
+  const versions = candidates.map((k) => graph.get(k)?.version).filter((v) => typeof v === "string");
+  let best = null;
+  try {
+    best = import_semver3.default.maxSatisfying(versions, range, { includePrerelease: true });
+  } catch {
+    best = null;
+  }
+  if (!best) return null;
+  for (const key of candidates) {
+    const node = graph.get(key);
+    if (node?.version === best) return key;
+  }
+  return null;
 }
 function satisfiesRange(version, range) {
   try {
@@ -4874,6 +4921,12 @@ function parseYarnClassicLockfile(content, manifest) {
     };
     graph.set(graphKey, node);
   }
+  const nameIndex = /* @__PURE__ */ new Map();
+  for (const [graphKey, node] of graph) {
+    const bucket = nameIndex.get(node.name);
+    if (bucket) bucket.push(graphKey);
+    else nameIndex.set(node.name, [graphKey]);
+  }
   const processed = /* @__PURE__ */ new Set();
   for (const [requestKey, entry] of Object.entries(entries)) {
     const name = extractNameFromRequestKey(requestKey);
@@ -4883,22 +4936,29 @@ function parseYarnClassicLockfile(content, manifest) {
     processed.add(graphKey);
     const node = graph.get(graphKey);
     if (!node) continue;
-    const allDeps = {
-      ...entry.dependencies ?? {},
-      ...entry.optionalDependencies ?? {}
-    };
-    for (const [depName, _depRange] of Object.entries(allDeps)) {
-      const depKey = `${depName}@${_depRange}`;
+    const seen = new Set(node.dependencies);
+    const pushEdge = (depName, depRange) => {
+      const depKey = `${depName}@${depRange}`;
       const depEntry = entries[depKey];
-      if (depEntry?.version) {
-        const depGraphKey = `${depName}@${depEntry.version}`;
-        if (graph.has(depGraphKey) && !node.dependencies.includes(depGraphKey)) {
-          node.dependencies.push(depGraphKey);
-        }
+      if (!depEntry?.version) return;
+      const depGraphKey = `${depName}@${depEntry.version}`;
+      if (graph.has(depGraphKey) && !seen.has(depGraphKey)) {
+        seen.add(depGraphKey);
+        node.dependencies.push(depGraphKey);
+      }
+    };
+    if (entry.dependencies) {
+      for (const [depName, depRange] of Object.entries(entry.dependencies)) {
+        pushEdge(depName, depRange);
+      }
+    }
+    if (entry.optionalDependencies) {
+      for (const [depName, depRange] of Object.entries(entry.optionalDependencies)) {
+        pushEdge(depName, depRange);
       }
     }
   }
-  classifyReachability(graph, entries, manifest);
+  classifyReachability(graph, entries, manifest, nameIndex);
   return { graph, skipped };
 }
 function extractNameFromRequestKey(requestKey) {
@@ -4912,7 +4972,7 @@ function extractNameFromRequestKey(requestKey) {
   if (atIdx === -1) return null;
   return key.slice(0, atIdx);
 }
-function classifyReachability(graph, entries, manifest) {
+function classifyReachability(graph, entries, manifest, _nameIndex) {
   const prodRoots = Object.entries(manifest.dependencies ?? {});
   const devRoots = Object.entries(manifest.devDependencies ?? {});
   const optionalRoots = Object.entries(manifest.optionalDependencies ?? {});
@@ -4920,10 +4980,16 @@ function classifyReachability(graph, entries, manifest) {
     const entryKey = `${name}@${range}`;
     const entry = entries[entryKey];
     if (entry?.version) {
-      return `${name}@${entry.version}`;
+      const graphKey = `${name}@${entry.version}`;
+      return graph.has(graphKey) ? graphKey : null;
     }
-    for (const [key, node] of graph) {
-      if (node.name === name) return key;
+    for (const [requestKey, e] of Object.entries(entries)) {
+      if (!e?.version) continue;
+      const parts = requestKey.split(",").map((s) => s.trim());
+      if (parts.includes(entryKey)) {
+        const graphKey = `${name}@${e.version}`;
+        return graph.has(graphKey) ? graphKey : null;
+      }
     }
     return null;
   }
@@ -4959,9 +5025,6 @@ function classifyReachability(graph, entries, manifest) {
   });
   bfs(optionalRoots, (node) => {
     node.isOptional = true;
-    if (!node.isProduction) {
-      node.isProduction = true;
-    }
   });
   bfs(devRoots, (node) => {
     if (!node.isProduction) {
@@ -4977,6 +5040,7 @@ function classifyReachability(graph, entries, manifest) {
 }
 
 // src/core/lockfile/yarn-berry.ts
+var MAX_KEY_LENGTH = 1024;
 function parseYarnBerryLockfile(content, manifest) {
   const raw = safeYamlParse(content);
   if (!raw || typeof raw !== "object") {
@@ -4987,6 +5051,11 @@ function parseYarnBerryLockfile(content, manifest) {
   const requestToGraph = /* @__PURE__ */ new Map();
   for (const [requestKey, entry] of Object.entries(raw)) {
     if (requestKey.startsWith("__")) continue;
+    if (requestKey.length > MAX_KEY_LENGTH) {
+      warn(`yarn-berry: skipping oversized request key (${requestKey.length} bytes, max ${MAX_KEY_LENGTH})`);
+      skipped.push({ key: requestKey.slice(0, 80) + "...", reason: "unparseable" });
+      continue;
+    }
     if (!entry || typeof entry !== "object" || !entry.version) {
       skipped.push({ key: requestKey, reason: "unparseable" });
       continue;
@@ -5033,9 +5102,16 @@ function parseYarnBerryLockfile(content, manifest) {
     };
     graph.set(graphKey, node);
   }
+  const nameIndex = /* @__PURE__ */ new Map();
+  for (const [graphKey, node] of graph) {
+    const bucket = nameIndex.get(node.name);
+    if (bucket) bucket.push(graphKey);
+    else nameIndex.set(node.name, [graphKey]);
+  }
   const processed = /* @__PURE__ */ new Set();
   for (const [requestKey, entry] of Object.entries(raw)) {
     if (requestKey.startsWith("__") || !entry?.version) continue;
+    if (requestKey.length > MAX_KEY_LENGTH) continue;
     const name = extractNameFromBerryKey(requestKey, entry.resolution);
     if (!name) continue;
     const graphKey = `${name}@${entry.version}`;
@@ -5043,25 +5119,24 @@ function parseYarnBerryLockfile(content, manifest) {
     processed.add(graphKey);
     const node = graph.get(graphKey);
     if (!node) continue;
-    const deps = entry.dependencies ?? {};
-    for (const [depName, depRange] of Object.entries(deps)) {
-      const cleanRange = depRange.startsWith("npm:") ? depRange.slice(4) : depRange;
-      const lookupKey = `${depName}@npm:${cleanRange}`;
-      let depGraphKey = requestToGraph.get(lookupKey);
-      if (!depGraphKey) {
-        for (const [key, n] of graph) {
-          if (n.name === depName) {
-            depGraphKey = key;
-            break;
-          }
+    const seen = new Set(node.dependencies);
+    if (entry.dependencies) {
+      for (const [depName, depRange] of Object.entries(entry.dependencies)) {
+        const cleanRange = depRange.startsWith("npm:") ? depRange.slice(4) : depRange;
+        const lookupKey = `${depName}@npm:${cleanRange}`;
+        let depGraphKey = requestToGraph.get(lookupKey);
+        if (!depGraphKey) {
+          const bucket = nameIndex.get(depName);
+          if (bucket && bucket.length > 0) depGraphKey = bucket[0];
         }
-      }
-      if (depGraphKey && graph.has(depGraphKey) && !node.dependencies.includes(depGraphKey)) {
-        node.dependencies.push(depGraphKey);
+        if (depGraphKey && graph.has(depGraphKey) && !seen.has(depGraphKey)) {
+          seen.add(depGraphKey);
+          node.dependencies.push(depGraphKey);
+        }
       }
     }
   }
-  classifyReachability2(graph, requestToGraph, manifest);
+  classifyReachability2(graph, requestToGraph, manifest, nameIndex);
   return { graph, skipped };
 }
 function extractNameFromBerryKey(requestKey, resolution) {
@@ -5081,14 +5156,14 @@ function extractNameFromBerryKey(requestKey, resolution) {
   }
   return null;
 }
-function classifyReachability2(graph, requestToGraph, manifest) {
+function classifyReachability2(graph, requestToGraph, manifest, _nameIndex) {
   function resolveRoot(name, range) {
     const lookupKey = `${name}@npm:${range}`;
     const key = requestToGraph.get(lookupKey);
-    if (key) return key;
-    for (const [gk, node] of graph) {
-      if (node.name === name) return gk;
-    }
+    if (key && graph.has(key)) return key;
+    const bareKey = `${name}@${range}`;
+    const key2 = requestToGraph.get(bareKey);
+    if (key2 && graph.has(key2)) return key2;
     return null;
   }
   function bfs(roots, markFn) {
@@ -5126,7 +5201,6 @@ function classifyReachability2(graph, requestToGraph, manifest) {
   });
   bfs(optionalRoots, (node) => {
     node.isOptional = true;
-    if (!node.isProduction) node.isProduction = true;
   });
   bfs(devRoots, (node) => {
     if (!node.isProduction) node.isDev = true;
@@ -5140,22 +5214,38 @@ function classifyReachability2(graph, requestToGraph, manifest) {
 }
 
 // src/core/lockfile/pnpm.ts
+var MAX_KEY_LENGTH2 = 1024;
+var SUPPORTED_LOCKFILE_VERSIONS = /* @__PURE__ */ new Set(["5", "5.0", "5.1", "5.2", "5.3", "5.4", "6", "6.0", "6.1", "9", "9.0"]);
+function parseLockfileVersion(rawVersion) {
+  if (typeof rawVersion === "number") {
+    if (!Number.isFinite(rawVersion)) return 0;
+    if (rawVersion === 5 || rawVersion === 6 || rawVersion === 9) return rawVersion;
+    return 0;
+  }
+  if (typeof rawVersion !== "string") return 0;
+  const trimmed = rawVersion.trim();
+  if (!SUPPORTED_LOCKFILE_VERSIONS.has(trimmed)) return 0;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : 0;
+}
 function parsePnpmLockfile(content) {
   const lockfile = safeYamlParse(content);
   if (!lockfile || typeof lockfile !== "object") {
     throw new Error("Failed to parse pnpm-lock.yaml: invalid YAML format.");
   }
   const rawVersion = lockfile.lockfileVersion;
-  const version = typeof rawVersion === "string" ? parseFloat(rawVersion) : rawVersion ?? 0;
+  const version = parseLockfileVersion(rawVersion);
   let type2;
-  if (version >= 9) {
+  if (version === 9) {
     type2 = "pnpm-v9";
-  } else if (version >= 6) {
+  } else if (version === 6) {
     type2 = "pnpm-v6";
-  } else if (version >= 5) {
+  } else if (version === 5) {
     type2 = "pnpm-v5";
   } else {
-    throw new Error(`Unsupported pnpm lockfile version ${rawVersion}. auditfix requires pnpm lockfileVersion 5+.`);
+    throw new Error(
+      `Unsupported pnpm lockfile version ${JSON.stringify(rawVersion)}. auditfix supports pnpm lockfileVersion 5, 6, or 9.`
+    );
   }
   const packages = lockfile.packages;
   if (!packages || typeof packages !== "object") {
@@ -5196,6 +5286,11 @@ function parsePnpmLockfile(content) {
     devRootNames.delete(name);
   }
   for (const [pkgKey, entry] of Object.entries(packages)) {
+    if (pkgKey.length > MAX_KEY_LENGTH2) {
+      warn(`pnpm: skipping oversized package key (${pkgKey.length} bytes, max ${MAX_KEY_LENGTH2})`);
+      skipped.push({ key: pkgKey.slice(0, 80) + "...", reason: "unparseable" });
+      continue;
+    }
     const parsed = parsePnpmPackageKey(pkgKey, entry, version);
     if (!parsed) {
       skipped.push({ key: pkgKey, reason: "unparseable" });
@@ -5220,26 +5315,42 @@ function parsePnpmLockfile(content) {
       continue;
     }
     const graphKey = `${name}@${pkgVersion}`;
-    const hasExplicitDev = entry.dev === true;
-    const hasExplicitOptional = entry.optional === true;
+    const hasDevField = typeof entry.dev === "boolean";
+    const hasOptionalField = typeof entry.optional === "boolean";
+    const explicitDev = entry.dev === true;
+    const explicitOptional = entry.optional === true;
     const isRootProd = prodRootNames.has(name);
     const isRootDev = devRootNames.has(name);
     const isRootOptional = optionalRootNames.has(name);
+    const isRootDep = isRootProd || isRootDev || isRootOptional;
+    let isProduction;
+    let isDev;
+    if (hasDevField) {
+      isDev = explicitDev;
+      isProduction = !explicitDev;
+    } else if (isRootProd) {
+      isProduction = true;
+      isDev = false;
+    } else if (isRootDev) {
+      isProduction = false;
+      isDev = true;
+    } else {
+      isProduction = false;
+      isDev = true;
+    }
+    const isOptional = hasOptionalField ? explicitOptional : isRootOptional;
     const node = {
       name,
       version: pkgVersion,
       resolved: tarball || entry.resolution?.integrity || "",
       integrity: entry.resolution?.integrity ?? "",
       dependencies: [],
-      isProduction: isRootProd || !hasExplicitDev && !isRootDev,
-      isDev: hasExplicitDev || isRootDev,
-      isOptional: hasExplicitOptional || isRootOptional,
-      depth: isRootProd || isRootDev || isRootOptional ? 1 : 2,
+      isProduction,
+      isDev,
+      isOptional,
+      depth: isRootDep ? 1 : 2,
       dependencyPath: []
     };
-    if (node.isProduction) {
-      node.isDev = false;
-    }
     const existing = graph.get(graphKey);
     if (existing) {
       if (node.isProduction && !existing.isProduction) {
@@ -5250,29 +5361,50 @@ function parsePnpmLockfile(content) {
       graph.set(graphKey, node);
     }
   }
+  const nameIndex = /* @__PURE__ */ new Map();
+  for (const [graphKey, node] of graph) {
+    const bucket = nameIndex.get(node.name);
+    if (bucket) bucket.push(graphKey);
+    else nameIndex.set(node.name, [graphKey]);
+  }
   for (const [pkgKey, entry] of Object.entries(packages)) {
+    if (pkgKey.length > MAX_KEY_LENGTH2) continue;
     const parsed = parsePnpmPackageKey(pkgKey, entry, version);
     if (!parsed) continue;
     const graphKey = `${parsed.name}@${parsed.pkgVersion}`;
     const node = graph.get(graphKey);
     if (!node) continue;
-    const allDeps = {
-      ...entry.dependencies ?? {},
-      ...entry.optionalDependencies ?? {}
-    };
-    for (const [depName, depVersion] of Object.entries(allDeps)) {
+    const seen = new Set(node.dependencies);
+    const pushEdge = (depName, depVersion) => {
+      if (!depVersion) return;
       const cleanVersion = cleanPnpmVersion(depVersion);
-      if (!cleanVersion) continue;
-      const depGraphKey = `${depName}@${cleanVersion}`;
-      if (graph.has(depGraphKey) && !node.dependencies.includes(depGraphKey)) {
-        node.dependencies.push(depGraphKey);
-      } else {
-        for (const [key, n] of graph) {
-          if (n.name === depName && !node.dependencies.includes(key)) {
-            node.dependencies.push(key);
-            break;
-          }
+      if (!cleanVersion) return;
+      const directKey = `${depName}@${cleanVersion}`;
+      if (graph.has(directKey)) {
+        if (!seen.has(directKey)) {
+          seen.add(directKey);
+          node.dependencies.push(directKey);
         }
+        return;
+      }
+      const bucket = nameIndex.get(depName);
+      if (!bucket) return;
+      for (const candidate of bucket) {
+        if (!seen.has(candidate)) {
+          seen.add(candidate);
+          node.dependencies.push(candidate);
+          return;
+        }
+      }
+    };
+    if (entry.dependencies) {
+      for (const [depName, depVersion] of Object.entries(entry.dependencies)) {
+        pushEdge(depName, depVersion);
+      }
+    }
+    if (entry.optionalDependencies) {
+      for (const [depName, depVersion] of Object.entries(entry.optionalDependencies)) {
+        pushEdge(depName, depVersion);
       }
     }
   }
@@ -5362,8 +5494,8 @@ function detectAndParseLockfile(projectDir) {
     "No lockfile found. auditfix requires a package-lock.json, yarn.lock, or pnpm-lock.yaml. Run `npm install` to generate one."
   );
 }
-function parseLockfile(projectDir, path2, filename) {
-  const content = readFileSync(path2, "utf-8");
+function parseLockfile(projectDir, path3, filename) {
+  const content = readFileSync(path3, "utf-8");
   if (content.trim().length === 0) {
     throw new Error(`Lockfile ${filename} is empty. Run \`npm install\` to regenerate.`);
   }
@@ -5421,30 +5553,42 @@ function readManifest(projectDir) {
 }
 
 // src/core/graph/reachability.ts
+var parentLinks = /* @__PURE__ */ new WeakMap();
 function computeDependencyPaths(graph) {
-  const visited = /* @__PURE__ */ new Set();
-  const roots = [];
+  const parents = /* @__PURE__ */ new Map();
+  const queue = [];
   for (const [key, node] of graph) {
     if (node.depth === 1) {
-      node.dependencyPath = [node.name];
-      roots.push(key);
+      parents.set(key, null);
+      queue.push(key);
     }
   }
-  const queue = [...roots];
-  for (const key of roots) visited.add(key);
-  let qi2 = 0;
-  while (qi2 < queue.length) {
-    const current = queue[qi2++];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const current = queue[qi];
     const node = graph.get(current);
+    if (!node) continue;
     for (const depKey of node.dependencies) {
-      if (visited.has(depKey)) continue;
-      visited.add(depKey);
-      const depNode = graph.get(depKey);
-      if (!depNode) continue;
-      depNode.dependencyPath = [...node.dependencyPath, depNode.name];
+      if (parents.has(depKey)) continue;
+      parents.set(depKey, current);
       queue.push(depKey);
     }
   }
+  parentLinks.set(graph, parents);
+}
+function resolveDependencyPath(graph, key) {
+  const parents = parentLinks.get(graph);
+  if (!parents) return [];
+  const names = [];
+  let cursor = key;
+  const seen = /* @__PURE__ */ new Set();
+  while (cursor != null && !seen.has(cursor)) {
+    seen.add(cursor);
+    const node = graph.get(cursor);
+    if (!node) break;
+    names.push(node.name);
+    cursor = parents.get(cursor) ?? null;
+  }
+  return names.reverse();
 }
 
 // src/core/advisory/osv-ranges.ts
@@ -5502,6 +5646,7 @@ var OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch";
 var OSV_VULN_URL = "https://api.osv.dev/v1/vulns";
 var MAX_BATCH_SIZE = 1e3;
 var MAX_CONCURRENT_FETCHES = 10;
+var MAX_CONCURRENT_BATCHES = 5;
 var MAX_RESPONSE_SIZE = 50 * 1024 * 1024;
 var MAX_INDIVIDUAL_SIZE = 1 * 1024 * 1024;
 async function fetchOsvAdvisories(graph) {
@@ -5519,7 +5664,7 @@ async function fetchOsvAdvisories(graph) {
     batches.push(packages.slice(i, i + MAX_BATCH_SIZE));
   }
   const allVulnIds = /* @__PURE__ */ new Set();
-  for (const batch of batches) {
+  const runBatch = async (batch) => {
     const query = {
       queries: batch.map((pkg) => ({
         version: pkg.version,
@@ -5529,26 +5674,33 @@ async function fetchOsvAdvisories(graph) {
         }
       }))
     };
-    try {
-      const response = await fetchWithValidation(OSV_BATCH_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(query)
-      }, MAX_RESPONSE_SIZE);
-      const batchResponse = response;
-      if (batchResponse.results) {
-        for (const result of batchResponse.results) {
-          if (result.vulns) {
-            for (const vuln of result.vulns) {
-              allVulnIds.add(vuln.id);
+    const response = await fetchWithValidation(OSV_BATCH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query)
+    }, MAX_RESPONSE_SIZE);
+    return response;
+  };
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
+    const chunk = batches.slice(i, i + MAX_CONCURRENT_BATCHES);
+    const results = await Promise.allSettled(chunk.map((batch) => runBatch(batch)));
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        const batchResponse = result.value;
+        if (batchResponse.results) {
+          for (const r of batchResponse.results) {
+            if (r.vulns) {
+              for (const vuln of r.vulns) {
+                allVulnIds.add(vuln.id);
+              }
             }
           }
         }
+      } else {
+        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        errors.push(`OSV batch query failed: ${msg}`);
+        warn(`OSV batch query failed: ${msg}`);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`OSV batch query failed: ${msg}`);
-      warn(`OSV batch query failed: ${msg}`);
     }
   }
   if (allVulnIds.size === 0) {
@@ -5572,25 +5724,33 @@ async function fetchOsvAdvisories(graph) {
   }
   const advisories = /* @__PURE__ */ new Map();
   for (const vuln of fullVulns) {
+    if (!vuln || !Array.isArray(vuln.affected)) continue;
     for (const affected of vuln.affected) {
-      if (affected.package.ecosystem.toLowerCase() !== "npm") continue;
-      const pkgName = affected.package.name;
-      const advisory = {
-        id: vuln.id,
-        aliases: vuln.aliases ?? [],
-        summary: vuln.summary ?? "",
-        details: vuln.details ?? "",
-        severity: vuln.severity ?? [],
-        affectedRange: affectedToSemverRange(affected),
-        fixVersion: affectedFixVersion(affected),
-        publishedAt: vuln.published ?? vuln.modified,
-        modifiedAt: vuln.modified,
-        references: vuln.references ?? [],
-        source: "osv-api"
-      };
-      const existing = advisories.get(pkgName) ?? [];
-      existing.push(advisory);
-      advisories.set(pkgName, existing);
+      try {
+        if (!affected?.package?.ecosystem || !affected.package.name) continue;
+        if (affected.package.ecosystem.toLowerCase() !== "npm") continue;
+        if (!Array.isArray(affected.ranges)) continue;
+        const pkgName = affected.package.name;
+        const advisory = {
+          id: vuln.id,
+          aliases: vuln.aliases ?? [],
+          summary: vuln.summary ?? "",
+          details: vuln.details ?? "",
+          severity: vuln.severity ?? [],
+          affectedRange: affectedToSemverRange(affected),
+          fixVersion: affectedFixVersion(affected),
+          publishedAt: vuln.published ?? vuln.modified,
+          modifiedAt: vuln.modified,
+          references: vuln.references ?? [],
+          source: "osv-api"
+        };
+        const existing = advisories.get(pkgName) ?? [];
+        existing.push(advisory);
+        advisories.set(pkgName, existing);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warn(`Skipping malformed OSV affected entry in ${vuln.id}: ${msg}`);
+      }
     }
   }
   return {
@@ -5775,7 +5935,7 @@ async function fetchNpmAdvisories(graph) {
     const pkgName = npmAdvisory.module_name;
     if (!pkgName) continue;
     const advisory = {
-      id: npmAdvisory.id != null ? `npm-${npmAdvisory.id}` : "npm-unknown",
+      id: npmAdvisory.id != null ? `npm-${pkgName}-${npmAdvisory.id}` : `npm-${pkgName}-unknown`,
       aliases: npmAdvisory.cves ?? [],
       summary: npmAdvisory.title ?? "",
       details: npmAdvisory.overview ?? "",
@@ -5896,11 +6056,16 @@ async function cacheAdvisoryBatch(advisories, cacheDir = getDefaultCacheDir()) {
     if (!Array.isArray(advisoryList) || advisoryList.length === 0) continue;
     const filePath = buildPackagePath(packageName, cacheDir);
     if (!filePath) continue;
-    const timestamp2 = Date.now();
-    const payload = JSON.stringify(advisoryList) + "|" + String(timestamp2);
-    const hmac = computeHmac(payload, hmacKey);
-    const entry = { data: advisoryList, timestamp: timestamp2, hmac };
-    atomicWrite(filePath, JSON.stringify(entry));
+    try {
+      const timestamp2 = Date.now();
+      const payload = JSON.stringify(advisoryList) + "|" + String(timestamp2);
+      const hmac = computeHmac(payload, hmacKey);
+      const entry = { data: advisoryList, timestamp: timestamp2, hmac };
+      atomicWrite(filePath, JSON.stringify(entry));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      debug(`Cache write failed for package "${packageName}": ${msg}`);
+    }
   }
 }
 function getCachedPackageAdvisories(packageName, cacheDir = getDefaultCacheDir()) {
@@ -5962,17 +6127,47 @@ function readCachedAdvisoriesForPackages(packageNames, cacheDir = getDefaultCach
 
 // src/core/advisory/offline-index.ts
 var import_semver7 = __toESM(require_semver2(), 1);
+import { existsSync as existsSync2 } from "fs";
+import path2 from "path";
+import { fileURLToPath, pathToFileURL } from "url";
 var generatedIndex = null;
 var generatedLoaded = false;
+var MODULE_NOT_FOUND_CODES = /* @__PURE__ */ new Set(["ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"]);
+function isModuleNotFound(err) {
+  if (!err || typeof err !== "object") return false;
+  const code = err.code;
+  return typeof code === "string" && MODULE_NOT_FOUND_CODES.has(code);
+}
+var defaultLoader = async () => {
+  const here = path2.dirname(fileURLToPath(import.meta.url));
+  const genPath = path2.join(here, "offline-index.generated.js");
+  if (!existsSync2(genPath)) {
+    const err = new Error(`generated index not present at ${genPath}`);
+    err.code = "ERR_MODULE_NOT_FOUND";
+    throw err;
+  }
+  const mod = await import(pathToFileURL(genPath).href);
+  if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
+    return mod.GENERATED_INDEX;
+  }
+  return null;
+};
+var activeLoader = defaultLoader;
 async function loadGeneratedIndex() {
   if (generatedLoaded) return generatedIndex;
-  generatedLoaded = true;
   try {
-    const mod = await import("./offline-index.generated.js");
-    if (Array.isArray(mod.GENERATED_INDEX) && mod.GENERATED_INDEX.length > 0) {
-      generatedIndex = mod.GENERATED_INDEX;
+    const loaded = await activeLoader();
+    if (loaded) generatedIndex = loaded;
+    generatedLoaded = true;
+  } catch (err) {
+    if (isModuleNotFound(err)) {
+      generatedLoaded = true;
+      return generatedIndex;
     }
-  } catch {
+    debug(
+      `offline-index: generated load failed (will retry): ${err instanceof Error ? err.message : String(err)}`
+    );
+    throw err;
   }
   return generatedIndex;
 }
@@ -6007,19 +6202,55 @@ function buildEffectiveIndex(gen) {
   return [...gen, ...extras];
 }
 var BUILTIN_INDEX = HARDCODED_INDEX;
-var indexReady = null;
-function ensureIndex() {
-  if (!indexReady) {
-    indexReady = loadGeneratedIndex().then((gen) => {
-      BUILTIN_INDEX = buildEffectiveIndex(gen);
-    });
+var INDEX_BY_NAME = buildNameIndex(HARDCODED_INDEX);
+function buildNameIndex(entries) {
+  const map2 = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const list = map2.get(entry.pkg);
+    if (list) {
+      list.push(entry);
+    } else {
+      map2.set(entry.pkg, [entry]);
+    }
   }
+  return map2;
+}
+var indexReady = null;
+var indexLoadFailures = 0;
+var MAX_INDEX_LOAD_FAILURES = 3;
+function ensureIndex() {
+  if (indexReady) return indexReady;
+  if (indexLoadFailures >= MAX_INDEX_LOAD_FAILURES) {
+    indexReady = Promise.resolve();
+    return indexReady;
+  }
+  indexReady = (async () => {
+    try {
+      const gen = await loadGeneratedIndex();
+      BUILTIN_INDEX = buildEffectiveIndex(gen);
+      INDEX_BY_NAME = buildNameIndex(BUILTIN_INDEX);
+      indexLoadFailures = 0;
+    } catch (err) {
+      indexLoadFailures += 1;
+      debug(
+        `offline-index: load attempt ${indexLoadFailures} failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+      if (indexLoadFailures < MAX_INDEX_LOAD_FAILURES) {
+        indexReady = null;
+      } else {
+        warn(
+          `offline-index: generated load failed ${indexLoadFailures} times; using hardcoded fallback`
+        );
+      }
+    }
+  })();
   return indexReady;
 }
 function queryOfflineIndex(packageName, version) {
   const results = [];
-  for (const entry of BUILTIN_INDEX) {
-    if (entry.pkg !== packageName) continue;
+  const entries = INDEX_BY_NAME.get(packageName);
+  if (!entries) return results;
+  for (const entry of entries) {
     try {
       if (import_semver7.default.satisfies(version, entry.range, { includePrerelease: true })) {
         results.push({
@@ -6060,6 +6291,23 @@ async function queryOfflineIndexBatch(graph) {
 }
 
 // src/core/advisory/resolver.ts
+var SOURCE_LABELS = {
+  "osv": "OSV.dev API (real-time)",
+  "osv-partial": "OSV.dev API (partial)",
+  "cache": "Local cache",
+  "cache-stale": "Local cache (stale)",
+  "offline": "Bundled offline index",
+  "npm-bulk": "npm bulk advisory endpoint"
+};
+function buildResult(advisories, sourceId, confidence, errors) {
+  return {
+    advisories,
+    source: SOURCE_LABELS[sourceId],
+    sourceId,
+    confidence,
+    errors
+  };
+}
 async function resolveAdvisories(graph) {
   const errors = [];
   info("Fetching advisories from OSV.dev...");
@@ -6069,23 +6317,18 @@ async function resolveAdvisories(graph) {
       cacheAdvisoryBatch(osvResult.advisories).catch((err) => {
         debug(`Cache write failed: ${err}`);
       });
-      return {
-        advisories: osvResult.advisories,
-        source: "OSV.dev API (real-time)",
-        confidence: "HIGH",
-        errors: []
-      };
+      return buildResult(osvResult.advisories, "osv", "HIGH", []);
     }
     if (osvResult.advisories.size > 0) {
       errors.push(...osvResult.errors);
       cacheAdvisoryBatch(osvResult.advisories).catch(() => {
       });
-      return {
-        advisories: osvResult.advisories,
-        source: "OSV.dev API (partial)",
-        confidence: "MEDIUM",
+      return buildResult(
+        osvResult.advisories,
+        "osv-partial",
+        "MEDIUM",
         errors
-      };
+      );
     }
     errors.push(...osvResult.errors);
   } catch (err) {
@@ -6097,23 +6340,13 @@ async function resolveAdvisories(graph) {
   const cachedAdvisories = getCachedAdvisoriesForGraph(graph);
   if (cachedAdvisories.size > 0) {
     info(`Using ${cachedAdvisories.size} cached advisory entries`);
-    return {
-      advisories: cachedAdvisories,
-      source: "Local cache",
-      confidence: "MEDIUM",
-      errors
-    };
+    return buildResult(cachedAdvisories, "cache", "MEDIUM", errors);
   }
   info("Checking bundled offline advisory index...");
   const offlineAdvisories = await queryOfflineIndexBatch(graph);
   if (offlineAdvisories.size > 0) {
     info(`Using ${offlineAdvisories.size} entries from offline index`);
-    return {
-      advisories: offlineAdvisories,
-      source: "Bundled offline index",
-      confidence: "LOW",
-      errors
-    };
+    return buildResult(offlineAdvisories, "offline", "LOW", errors);
   }
   info("Offline index empty, trying npm bulk advisory endpoint...");
   try {
@@ -6122,12 +6355,12 @@ async function resolveAdvisories(graph) {
       cacheAdvisoryBatch(npmResult.advisories).catch(() => {
       });
       errors.push(...npmResult.errors);
-      return {
-        advisories: npmResult.advisories,
-        source: "npm bulk advisory endpoint",
-        confidence: npmResult.errors.length > 0 ? "LOW" : "MEDIUM",
+      return buildResult(
+        npmResult.advisories,
+        "npm-bulk",
+        npmResult.errors.length > 0 ? "LOW" : "MEDIUM",
         errors
-      };
+      );
     }
     errors.push(...npmResult.errors);
   } catch (err) {
@@ -6167,6 +6400,7 @@ async function resolveAdvisoriesWithCache(graph, options) {
       info(`All ${packageNames.length} packages served from fresh cache (<1h)`);
       return {
         advisories: cached.advisories,
+        sourceId: "cache",
         source: "Local cache (fresh)",
         confidence: "HIGH",
         errors: []
@@ -6179,6 +6413,7 @@ async function resolveAdvisoriesWithCache(graph, options) {
       });
       return {
         advisories: cached.advisories,
+        sourceId: "cache-stale",
         source: "Local cache (stale, refreshing)",
         confidence: "HIGH",
         errors: []
@@ -6202,19 +6437,28 @@ function getCachedAdvisoriesForGraph(graph) {
 }
 
 // src/core/advisory/matcher.ts
+var import_semver8 = __toESM(require_semver2(), 1);
 function matchAdvisories(graph, advisories) {
   const matches = [];
-  for (const [, node] of graph) {
+  const compiled = /* @__PURE__ */ new WeakMap();
+  for (const [key, node] of graph) {
     const pkgAdvisories = advisories.get(node.name);
     if (!pkgAdvisories) continue;
     for (const advisory of pkgAdvisories) {
       if (!advisory.affectedRange) continue;
-      if (satisfies(node.version, advisory.affectedRange)) {
+      let range = compiled.get(advisory);
+      if (range === void 0) {
+        range = compileRange(advisory.affectedRange);
+        compiled.set(advisory, range);
+      }
+      const isAffected = range ? testRange(node.version, range) : satisfies(node.version, advisory.affectedRange);
+      if (isAffected) {
+        const path3 = node.dependencyPath.length > 0 ? node.dependencyPath : resolveDependencyPath(graph, key);
         matches.push({
           advisory,
           package: node.name,
           installedVersion: node.version,
-          dependencyPath: node.dependencyPath,
+          dependencyPath: path3,
           isProduction: node.isProduction
         });
       }
@@ -6271,15 +6515,22 @@ function parseMetrics(vector) {
   return metrics;
 }
 function computeBaseScore(m) {
-  const av = METRIC_WEIGHTS.AV[m.AV] ?? 0;
-  const ac = METRIC_WEIGHTS.AC[m.AC] ?? 0;
-  const ui = METRIC_WEIGHTS.UI[m.UI] ?? 0;
+  const requiredMetrics = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"];
+  for (const metric of requiredMetrics) {
+    if (!m[metric]) return 0;
+  }
+  const av = METRIC_WEIGHTS.AV[m.AV];
+  const ac = METRIC_WEIGHTS.AC[m.AC];
+  const ui = METRIC_WEIGHTS.UI[m.UI];
   const scopeChanged = m.S === "C";
   const prWeights = scopeChanged ? METRIC_WEIGHTS.PR_CHANGED : METRIC_WEIGHTS.PR;
-  const pr = prWeights[m.PR] ?? 0;
-  const c = METRIC_WEIGHTS.C[m.C] ?? 0;
-  const i = METRIC_WEIGHTS.I[m.I] ?? 0;
-  const a = METRIC_WEIGHTS.A[m.A] ?? 0;
+  const pr = prWeights[m.PR];
+  const c = METRIC_WEIGHTS.C[m.C];
+  const i = METRIC_WEIGHTS.I[m.I];
+  const a = METRIC_WEIGHTS.A[m.A];
+  if (av === void 0 || ac === void 0 || ui === void 0 || pr === void 0 || c === void 0 || i === void 0 || a === void 0) {
+    return 0;
+  }
   const iss = 1 - (1 - c) * (1 - i) * (1 - a);
   let impact;
   if (scopeChanged) {
@@ -6298,58 +6549,275 @@ function computeBaseScore(m) {
   return Math.ceil(baseScore * 10) / 10;
 }
 
+// src/utils/fetch.ts
+var FetchValidationError = class extends Error {
+  kind;
+  url;
+  status;
+  constructor(kind, url, message, status) {
+    super(message);
+    this.name = "FetchValidationError";
+    this.kind = kind;
+    this.url = url;
+    this.status = status;
+  }
+};
+var HTML_SNIFF_PREFIXES = ["<!doctype html", "<html", "<?xml"];
+var HTML_SNIFF_LENGTH = 32;
+function contentTypeMatches(actual, expected) {
+  if (!actual) return false;
+  const lowered = actual.toLowerCase();
+  if (typeof expected === "string") {
+    return lowered.startsWith(expected.toLowerCase());
+  }
+  return expected.test(actual);
+}
+function startsWithHtml(prefix) {
+  const trimmed = prefix.trimStart().toLowerCase();
+  return HTML_SNIFF_PREFIXES.some((p) => trimmed.startsWith(p));
+}
+async function fetchWithValidation2(url, options) {
+  const { maxBytes, timeoutMs = 3e4, contentType, signal: externalSignal, ...init } = options;
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    throw new FetchValidationError("oversize", url, `Invalid maxBytes: ${maxBytes}`);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const externalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", externalAbort, { once: true });
+  }
+  let response;
+  try {
+    response = await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", externalAbort);
+    const name = err?.name;
+    if (name === "AbortError" || name === "TimeoutError") {
+      throw new FetchValidationError("timeout", url, `Request timed out after ${timeoutMs}ms`);
+    }
+    throw new FetchValidationError(
+      "network",
+      url,
+      `Network failure: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  try {
+    if (!response.ok) {
+      throw new FetchValidationError(
+        "http-status",
+        url,
+        `HTTP ${response.status}: ${response.statusText}`,
+        response.status
+      );
+    }
+    const rawCt = response.headers.get("content-type") ?? "";
+    if (!contentTypeMatches(rawCt, contentType)) {
+      throw new FetchValidationError(
+        "content-type",
+        url,
+        `Unexpected Content-Type: ${rawCt || "(missing)"}. Expected ${String(contentType)}.`
+      );
+    }
+    const clHeader = response.headers.get("content-length");
+    if (clHeader !== null) {
+      const declared = Number.parseInt(clHeader, 10);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new FetchValidationError(
+          "oversize",
+          url,
+          `Response too large (Content-Length ${declared} > ${maxBytes})`
+        );
+      }
+    }
+    const body = response.body;
+    if (!body) {
+      const text = await response.text();
+      if (text.length > maxBytes) {
+        throw new FetchValidationError(
+          "oversize",
+          url,
+          `Response body too large (${text.length} > ${maxBytes} bytes)`
+        );
+      }
+      if (startsWithHtml(text.slice(0, HTML_SNIFF_LENGTH))) {
+        throw new FetchValidationError(
+          "html-body",
+          url,
+          "Response body starts with HTML markup despite JSON content-type"
+        );
+      }
+      return text;
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let received = 0;
+    let sniffed = false;
+    let sniffBuf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+        }
+        throw new FetchValidationError(
+          "oversize",
+          url,
+          `Response body exceeded ${maxBytes} bytes during streaming (read ${received})`
+        );
+      }
+      const piece = decoder.decode(value, { stream: true });
+      chunks.push(piece);
+      if (!sniffed) {
+        sniffBuf += piece;
+        if (sniffBuf.length >= HTML_SNIFF_LENGTH || sniffBuf.trimStart().length >= HTML_SNIFF_LENGTH) {
+          if (startsWithHtml(sniffBuf.slice(0, HTML_SNIFF_LENGTH + 8))) {
+            try {
+              await reader.cancel();
+            } catch {
+            }
+            throw new FetchValidationError(
+              "html-body",
+              url,
+              "Response body starts with HTML markup despite JSON content-type"
+            );
+          }
+          sniffed = true;
+          sniffBuf = "";
+        }
+      }
+    }
+    chunks.push(decoder.decode());
+    if (!sniffed && startsWithHtml(chunks.join("").slice(0, HTML_SNIFF_LENGTH))) {
+      throw new FetchValidationError(
+        "html-body",
+        url,
+        "Response body starts with HTML markup despite JSON content-type"
+      );
+    }
+    return chunks.join("");
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", externalAbort);
+  }
+}
+async function fetchJsonWithValidation(url, options) {
+  const body = await fetchWithValidation2(url, options);
+  try {
+    return JSON.parse(body);
+  } catch (err) {
+    throw new FetchValidationError(
+      "content-type",
+      url,
+      `Response body failed to parse as JSON: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 // src/core/advisory/epss.ts
-var kevCache = null;
-var kevCacheTime = 0;
-var KEV_CACHE_TTL = 4 * 60 * 60 * 1e3;
+var EPSS_MAX_BYTES = 10 * 1024 * 1024;
+var KEV_MAX_BYTES = 20 * 1024 * 1024;
+var EPSS_TIMEOUT_MS = 3e4;
+var KEV_TIMEOUT_MS = 3e4;
+var EPSS_BATCH_SIZE = 50;
+var EPSS_BATCH_CONCURRENCY = 5;
+function makeKevCache(ttlMs) {
+  const state = {
+    cache: null,
+    cachedAt: 0,
+    ttlMs,
+    reset() {
+      state.cache = null;
+      state.cachedAt = 0;
+    }
+  };
+  return state;
+}
+var kevState = makeKevCache(4 * 60 * 60 * 1e3);
+async function pMap(items, fn, concurrency) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  async function worker() {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+async function fetchEpssBatch(batch) {
+  const param = batch.join(",");
+  const url = `https://api.first.org/data/v1/epss?cve=${param}`;
+  try {
+    const data = await fetchJsonWithValidation(url, {
+      maxBytes: EPSS_MAX_BYTES,
+      timeoutMs: EPSS_TIMEOUT_MS,
+      contentType: "application/json"
+    });
+    return data.data ?? [];
+  } catch (err) {
+    if (err instanceof FetchValidationError) {
+      debug(`EPSS batch query failed (${err.kind}): ${err.message}`);
+    } else {
+      debug(`EPSS batch query failed: ${err instanceof Error ? err.message : err}`);
+    }
+    return [];
+  }
+}
 async function fetchEpssScores(cveIds) {
   const results = /* @__PURE__ */ new Map();
   if (cveIds.length === 0) return results;
-  const BATCH_SIZE = 50;
-  for (let i = 0; i < cveIds.length; i += BATCH_SIZE) {
-    const batch = cveIds.slice(i, i + BATCH_SIZE);
-    try {
-      const param = batch.join(",");
-      const response = await fetch(
-        `https://api.first.org/data/v1/epss?cve=${param}`,
-        { signal: AbortSignal.timeout(1e4) }
-      );
-      if (!response.ok) continue;
-      const data = await response.json();
-      for (const entry of data.data ?? []) {
-        results.set(entry.cve, {
-          cve: entry.cve,
-          epss: parseFloat(entry.epss),
-          percentile: parseFloat(entry.percentile)
-        });
-      }
-    } catch (err) {
-      debug(`EPSS batch query failed: ${err instanceof Error ? err.message : err}`);
+  const batches = [];
+  for (let i = 0; i < cveIds.length; i += EPSS_BATCH_SIZE) {
+    batches.push(cveIds.slice(i, i + EPSS_BATCH_SIZE));
+  }
+  const batchResults = await pMap(batches, fetchEpssBatch, EPSS_BATCH_CONCURRENCY);
+  for (const data of batchResults) {
+    for (const entry of data ?? []) {
+      results.set(entry.cve, {
+        cve: entry.cve,
+        epss: parseFloat(entry.epss),
+        percentile: parseFloat(entry.percentile)
+      });
     }
   }
   return results;
 }
 async function fetchKevCatalog() {
-  if (kevCache && Date.now() - kevCacheTime < KEV_CACHE_TTL) {
-    return kevCache;
+  if (kevState.cache && Date.now() - kevState.cachedAt < kevState.ttlMs) {
+    return kevState.cache;
   }
   try {
-    const response = await fetch(
+    const data = await fetchJsonWithValidation(
       "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-      { signal: AbortSignal.timeout(15e3) }
+      {
+        maxBytes: KEV_MAX_BYTES,
+        timeoutMs: KEV_TIMEOUT_MS,
+        contentType: "application/json"
+      }
     );
-    if (!response.ok) {
-      debug(`CISA KEV fetch failed: HTTP ${response.status}`);
-      return kevCache ?? /* @__PURE__ */ new Set();
-    }
-    const data = await response.json();
-    kevCache = new Set(data.vulnerabilities.map((v) => v.cveID));
-    kevCacheTime = Date.now();
-    debug(`CISA KEV loaded: ${kevCache.size} entries`);
-    return kevCache;
+    const next = new Set((data.vulnerabilities ?? []).map((v) => v.cveID));
+    kevState.cache = next;
+    kevState.cachedAt = Date.now();
+    debug(`CISA KEV loaded: ${next.size} entries`);
+    return next;
   } catch (err) {
-    debug(`CISA KEV fetch failed: ${err instanceof Error ? err.message : err}`);
-    return kevCache ?? /* @__PURE__ */ new Set();
+    if (err instanceof FetchValidationError) {
+      debug(`CISA KEV fetch failed (${err.kind}): ${err.message}`);
+    } else {
+      debug(`CISA KEV fetch failed: ${err instanceof Error ? err.message : err}`);
+    }
+    return kevState.cache ?? /* @__PURE__ */ new Set();
   }
 }
 function extractCveIds(aliases) {
@@ -6436,7 +6904,10 @@ function scoreMatch(match, ctx = {}) {
   return { match, risk };
 }
 function scoreAllMatches(matches, ctx = {}) {
-  return matches.map((m) => scoreMatch(m, ctx)).sort((a, b) => b.risk.score - a.risk.score);
+  return matches.map((m) => scoreMatch(m, ctx)).sort((a, b) => {
+    if (a.risk.score !== b.risk.score) return b.risk.score - a.risk.score;
+    return a.match.advisory.id.localeCompare(b.match.advisory.id);
+  });
 }
 function computeCompositeScore(factors) {
   let score = 0;
@@ -6487,12 +6958,12 @@ function hasExploitIndicator(urls) {
 }
 
 // src/core/allowlist/local.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, existsSync as existsSync2, lstatSync as lstatSync2 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, existsSync as existsSync3, lstatSync as lstatSync2 } from "fs";
 import { join as join3 } from "path";
 var ALLOWLIST_FILENAME = ".auditfixignore";
 function loadLocalAllowList(projectDir) {
   const filePath = join3(projectDir, ALLOWLIST_FILENAME);
-  if (!existsSync2(filePath)) {
+  if (!existsSync3(filePath)) {
     return { ignore: [] };
   }
   try {
@@ -6562,15 +7033,15 @@ function applyAllowList(matches, allowList) {
 }
 
 // src/core/workspace/detector.ts
-import { readFileSync as readFileSync4, existsSync as existsSync3, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
+import { readFileSync as readFileSync4, existsSync as existsSync4, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
 import { join as join4, relative } from "path";
 function detectWorkspaces(projectDir) {
   const pnpmWorkspacePath = join4(projectDir, "pnpm-workspace.yaml");
-  if (existsSync3(pnpmWorkspacePath)) {
+  if (existsSync4(pnpmWorkspacePath)) {
     return detectPnpmWorkspaces(projectDir, pnpmWorkspacePath);
   }
   const packageJsonPath = join4(projectDir, "package.json");
-  if (existsSync3(packageJsonPath)) {
+  if (existsSync4(packageJsonPath)) {
     try {
       const content = readFileSync4(packageJsonPath, "utf-8");
       const pkg = safeJsonParse(content);
@@ -6617,9 +7088,9 @@ function resolveWorkspaceGlobs(projectDir, patterns) {
     if (pattern.startsWith("!")) continue;
     const cleanPattern = pattern.replace(/\/?\*\*?$/, "");
     const baseDir = join4(projectDir, cleanPattern);
-    if (!existsSync3(baseDir) || !statSync2(baseDir).isDirectory()) {
+    if (!existsSync4(baseDir) || !statSync2(baseDir).isDirectory()) {
       const directPkg = join4(projectDir, pattern, "package.json");
-      if (existsSync3(directPkg)) {
+      if (existsSync4(directPkg)) {
         const ws = readWorkspacePackage(projectDir, pattern);
         if (ws && !seen.has(ws.name)) {
           seen.add(ws.name);
@@ -6633,7 +7104,7 @@ function resolveWorkspaceGlobs(projectDir, patterns) {
       for (const entry of entries) {
         const entryPath = join4(baseDir, entry);
         const pkgJsonPath = join4(entryPath, "package.json");
-        if (statSync2(entryPath).isDirectory() && existsSync3(pkgJsonPath)) {
+        if (statSync2(entryPath).isDirectory() && existsSync4(pkgJsonPath)) {
           const relPath = relative(projectDir, entryPath).replace(/\\/g, "/");
           const ws = readWorkspacePackage(projectDir, relPath);
           if (ws && !seen.has(ws.name)) {
@@ -6713,7 +7184,7 @@ function mapDepsToWorkspaces(graph, workspaces) {
 }
 
 // src/core/graph/import-chain.ts
-import { readFileSync as readFileSync5, existsSync as existsSync4, readdirSync as readdirSync3, statSync as statSync3 } from "fs";
+import { readFileSync as readFileSync5, existsSync as existsSync5, readdirSync as readdirSync3, statSync as statSync3 } from "fs";
 import { join as join5, extname, resolve as resolve3 } from "path";
 var JS_EXTENSIONS = /* @__PURE__ */ new Set([".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"]);
 var NODE_BUILTINS = /* @__PURE__ */ new Set([
@@ -6772,65 +7243,60 @@ var NODE_BUILTINS = /* @__PURE__ */ new Set([
   "worker_threads",
   "zlib"
 ]);
-var IMPORT_PATTERNS = [
-  // ES import: import x from 'pkg', import { x } from 'pkg', import 'pkg'
-  /(?:import\s+(?:[\w{},*\s]+\s+from\s+)?['"])([^'"./][^'"]*)['"]/g,
-  // require: require('pkg'), require("pkg")
-  /require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)/g,
-  // dynamic import: import('pkg'), import("pkg"), import(`pkg`)
-  /import\s*\(\s*['"`]([^'"`./][^'"`]*?)['"`]\s*\)/g,
-  // re-export: export { foo } from 'pkg', export * from 'pkg'
-  /export\s+(?:[\w{},*\s]+\s+from\s+)['"]([^'"./][^'"]*)['"]/g
-];
+var IMPORT_PATTERN = /(?:import\s+(?:[\w{},*\s]+\s+from\s+)?['"]([^'"./][^'"]*)['"])|(?:export\s+(?:[\w{},*\s]+\s+from\s+)['"]([^'"./][^'"]*)['"])|(?:require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\))|(?:import\s*\(\s*['"`]([^'"`./][^'"`]*?)['"`]\s*\))/g;
 function stripComments(source) {
-  const result = [];
-  let i = 0;
   const len = source.length;
+  let out = "";
+  let i = 0;
+  let segStart = 0;
   while (i < len) {
-    const ch = source[i];
-    const next = i + 1 < len ? source[i + 1] : "";
-    if (ch === "/" && next === "/") {
-      i += 2;
-      while (i < len && source[i] !== "\n") i++;
-      continue;
+    const ch = source.charCodeAt(i);
+    if (ch === 47 && i + 1 < len) {
+      const next = source.charCodeAt(i + 1);
+      if (next === 47) {
+        out += source.slice(segStart, i);
+        i += 2;
+        while (i < len && source.charCodeAt(i) !== 10) i++;
+        segStart = i;
+        continue;
+      }
+      if (next === 42) {
+        out += source.slice(segStart, i);
+        i += 2;
+        while (i + 1 < len) {
+          if (source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47) {
+            i += 2;
+            break;
+          }
+          i++;
+        }
+        if (i + 1 >= len) i = len;
+        out += " ";
+        segStart = i;
+        continue;
+      }
     }
-    if (ch === "/" && next === "*") {
-      i += 2;
+    if (ch === 34 || ch === 39 || ch === 96) {
+      const quote = ch;
+      i++;
       while (i < len) {
-        if (source[i] === "*" && i + 1 < len && source[i + 1] === "/") {
+        const sc = source.charCodeAt(i);
+        if (sc === 92) {
           i += 2;
+          continue;
+        }
+        if (sc === quote) {
+          i++;
           break;
         }
         i++;
       }
-      result.push(" ");
       continue;
     }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
-      result.push(ch);
-      i++;
-      while (i < len) {
-        const sc = source[i];
-        if (sc === "\\") {
-          result.push(sc);
-          i++;
-          if (i < len) {
-            result.push(source[i]);
-            i++;
-          }
-          continue;
-        }
-        result.push(sc);
-        i++;
-        if (sc === quote) break;
-      }
-      continue;
-    }
-    result.push(ch);
     i++;
   }
-  return result.join("");
+  out += source.slice(segStart, len);
+  return out;
 }
 function isNodeBuiltin(specifier) {
   if (specifier.startsWith("node:")) return true;
@@ -6838,74 +7304,95 @@ function isNodeBuiltin(specifier) {
 }
 function extractPackageName2(specifier) {
   if (specifier.startsWith("@")) {
-    return specifier.split("/").slice(0, 2).join("/");
+    const first = specifier.indexOf("/");
+    if (first < 0) return specifier;
+    const second = specifier.indexOf("/", first + 1);
+    return second < 0 ? specifier : specifier.slice(0, second);
   }
-  return specifier.split("/")[0];
+  const slash = specifier.indexOf("/");
+  return slash < 0 ? specifier : specifier.slice(0, slash);
 }
 function extractImports(content) {
   const imports = /* @__PURE__ */ new Set();
   const cleaned = stripComments(content);
-  for (const pattern of IMPORT_PATTERNS) {
-    pattern.lastIndex = 0;
-    let match;
-    while ((match = pattern.exec(cleaned)) !== null) {
-      const specifier = match[1];
-      if (specifier.startsWith(".")) continue;
-      if (isNodeBuiltin(specifier)) continue;
-      const pkgName = extractPackageName2(specifier);
-      if (pkgName) {
-        imports.add(pkgName);
-      }
-    }
+  IMPORT_PATTERN.lastIndex = 0;
+  let m;
+  while ((m = IMPORT_PATTERN.exec(cleaned)) !== null) {
+    const specifier = m[1] ?? m[2] ?? m[3] ?? m[4];
+    if (!specifier) continue;
+    if (specifier.charCodeAt(0) === 46) continue;
+    if (isNodeBuiltin(specifier)) continue;
+    const pkgName = extractPackageName2(specifier);
+    if (pkgName) imports.add(pkgName);
   }
   return imports;
 }
+var fileCache = /* @__PURE__ */ new Map();
 function scanImportChains(projectDir, entryDirs = ["src", "lib", "app", "pages", "routes"]) {
   const importedPackages = /* @__PURE__ */ new Set();
   const scannedFiles = /* @__PURE__ */ new Set();
   for (const dir of entryDirs) {
     const fullDir = join5(projectDir, dir);
-    if (existsSync4(fullDir) && statSync3(fullDir).isDirectory()) {
-      walkDir(fullDir, scannedFiles, importedPackages);
+    if (existsSync5(fullDir)) {
+      try {
+        if (statSync3(fullDir).isDirectory()) {
+          walkDir(fullDir, scannedFiles, importedPackages);
+        }
+      } catch {
+      }
     }
   }
   for (const entry of ["index.js", "index.ts", "index.mjs", "server.js", "server.ts", "main.js", "main.ts"]) {
     const entryPath = join5(projectDir, entry);
-    if (existsSync4(entryPath)) {
+    if (existsSync5(entryPath)) {
       scanFile(entryPath, scannedFiles, importedPackages);
     }
   }
   debug(`Import chain scan: ${scannedFiles.size} files scanned, ${importedPackages.size} packages imported`);
   return importedPackages;
 }
-function walkDir(dir, scanned, imports) {
+var MAX_SCAN_DEPTH = 15;
+var MAX_SCAN_FILES = 1e4;
+var SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "dist", "build", "coverage"]);
+function walkDir(dir, scanned, imports, depth = 0) {
+  if (depth > MAX_SCAN_DEPTH || scanned.size > MAX_SCAN_FILES) return;
+  let entries;
   try {
-    const entries = readdirSync3(dir);
-    for (const entry of entries) {
-      if (entry === "node_modules" || entry === ".git" || entry === "dist" || entry === "build" || entry === "coverage") continue;
-      const fullPath = join5(dir, entry);
-      try {
-        const stat = statSync3(fullPath);
-        if (stat.isDirectory()) {
-          walkDir(fullPath, scanned, imports);
-        } else if (stat.isFile() && JS_EXTENSIONS.has(extname(entry))) {
-          scanFile(fullPath, scanned, imports);
-        }
-      } catch {
-      }
-    }
+    entries = readdirSync3(dir, { withFileTypes: true });
   } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const name = entry.name;
+    if (SKIP_DIRS.has(name)) continue;
+    const fullPath = join5(dir, name);
+    if (entry.isDirectory()) {
+      walkDir(fullPath, scanned, imports, depth + 1);
+    } else if (entry.isFile() && JS_EXTENSIONS.has(extname(name))) {
+      scanFile(fullPath, scanned, imports);
+    }
   }
 }
 function scanFile(filePath, scanned, imports) {
   const resolved = resolve3(filePath);
   if (scanned.has(resolved)) return;
   scanned.add(resolved);
+  let mtimeMs;
+  try {
+    mtimeMs = statSync3(resolved).mtimeMs;
+  } catch {
+    return;
+  }
+  const cached = fileCache.get(resolved);
+  if (cached && cached.mtimeMs === mtimeMs) {
+    for (const pkg of cached.packages) imports.add(pkg);
+    return;
+  }
   try {
     const content = readFileSync5(resolved, "utf-8");
-    for (const pkg of extractImports(content)) {
-      imports.add(pkg);
-    }
+    const pkgs = extractImports(content);
+    fileCache.set(resolved, { mtimeMs, packages: pkgs });
+    for (const pkg of pkgs) imports.add(pkg);
   } catch {
   }
 }
@@ -6970,16 +7457,14 @@ async function analyze(options) {
   }
   info("Matching advisories...");
   const allMatches = matchAdvisories(lockfileResult.graph, advisories);
-  if (depToWorkspaces) {
-    for (const match of allMatches) {
+  for (const match of allMatches) {
+    if (depToWorkspaces) {
       const graphKey = `${match.package}@${match.installedVersion}`;
       const ws = depToWorkspaces.get(graphKey);
       if (ws && ws.size > 0) {
         match.workspaces = [...ws];
       }
     }
-  }
-  for (const match of allMatches) {
     match.isDirectlyImported = isDirectlyImported(match.package, importedPackages);
   }
   info(`Found ${allMatches.length} vulnerability matches`);
@@ -7004,26 +7489,20 @@ async function analyze(options) {
     scorerCtx = { epssScores, kevSet };
     debug(`EPSS: ${epssScores.size} scores, KEV: ${kevSet.size} entries`);
   }
-  let scored = scoreAllMatches(matches, scorerCtx);
-  if (options.workspace) {
-    scored = scored.filter(
-      (s) => s.match.workspaces?.includes(options.workspace) ?? false
-    );
-  }
-  if (options.productionOnly) {
-    scored = scored.filter((s) => s.match.isProduction);
-  }
-  if (options.severityThreshold && options.severityThreshold !== "info") {
-    const severityRank = {
-      critical: 4,
-      high: 3,
-      medium: 2,
-      low: 1,
-      info: 0
-    };
-    const minRank = severityRank[options.severityThreshold] ?? 0;
-    scored = scored.filter((s) => severityRank[s.risk.label] >= minRank);
-  }
+  const severityRank = {
+    critical: 4,
+    high: 3,
+    medium: 2,
+    low: 1,
+    info: 0
+  };
+  const minRank = options.severityThreshold && options.severityThreshold !== "info" ? severityRank[options.severityThreshold] ?? 0 : 0;
+  let scored = scoreAllMatches(matches, scorerCtx).filter((s) => {
+    if (options.workspace && !(s.match.workspaces?.includes(options.workspace) ?? false)) return false;
+    if (options.productionOnly && !s.match.isProduction) return false;
+    if (minRank > 0 && severityRank[s.risk.label] < minRank) return false;
+    return true;
+  });
   const skipRate = lockfileResult.skipped.length / Math.max(lockfileResult.packageCount, 1);
   if (skipRate > 0.1) {
     confidence = "UNRELIABLE";
@@ -7254,6 +7733,56 @@ async function findExistingComment(token, repo, prNumber) {
   }
   return null;
 }
+function escapeMarkdown(s) {
+  if (s == null) return "";
+  const str2 = String(s);
+  let out = "";
+  for (let i = 0; i < str2.length; i++) {
+    const ch = str2[i];
+    switch (ch) {
+      case "\\":
+        out += "\\\\";
+        break;
+      case "`":
+        out += "\\`";
+        break;
+      case "|":
+        out += "\\|";
+        break;
+      case "[":
+        out += "\\[";
+        break;
+      case "]":
+        out += "\\]";
+        break;
+      case "(":
+        out += "\\(";
+        break;
+      case ")":
+        out += "\\)";
+        break;
+      case "<":
+        out += "&lt;";
+        break;
+      case ">":
+        out += "&gt;";
+        break;
+      case "@":
+        out += "@\u200B";
+        break;
+      // zero-width space defeats @mention autolink
+      case "\r":
+        out += " ";
+        break;
+      case "\n":
+        out += " ";
+        break;
+      default:
+        out += ch;
+    }
+  }
+  return out;
+}
 function severityEmoji(label) {
   switch (label) {
     case "critical":
@@ -7311,9 +7840,11 @@ function buildCommentBody(report) {
     lines.push("| Package | Version | Severity | Score | Fix |");
     lines.push("| --- | --- | --- | --- | --- |");
     for (const v of top) {
-      const fix = v.risk.factors.fixVersion ?? "\u2014";
-      const sev = `${severityEmoji(v.risk.label)} ${v.risk.label}`;
-      lines.push(`| \`${v.match.package}\` | ${v.match.installedVersion} | ${sev} | ${v.risk.score} | ${fix} |`);
+      const fix = v.risk.factors.fixVersion ? escapeMarkdown(v.risk.factors.fixVersion) : "\u2014";
+      const sev = `${severityEmoji(v.risk.label)} ${escapeMarkdown(v.risk.label)}`;
+      const pkg = escapeMarkdown(v.match.package);
+      const ver = escapeMarkdown(v.match.installedVersion);
+      lines.push(`| \`${pkg}\` | ${ver} | ${sev} | ${v.risk.score} | ${fix} |`);
     }
     if (total > 10) {
       lines.push("");
@@ -7328,7 +7859,10 @@ function buildCommentBody(report) {
     lines.push(`${fixable.length} ${fixable.length === 1 ? "vulnerability has" : "vulnerabilities have"} a known fix:`);
     lines.push("");
     for (const v of fixable.slice(0, 10)) {
-      lines.push(`- \`${v.match.package}\` ${v.match.installedVersion} \u2192 **${v.risk.factors.fixVersion}**`);
+      const pkg = escapeMarkdown(v.match.package);
+      const ver = escapeMarkdown(v.match.installedVersion);
+      const fix = escapeMarkdown(v.risk.factors.fixVersion ?? "");
+      lines.push(`- \`${pkg}\` ${ver} \u2192 **${fix}**`);
     }
     if (fixable.length > 10) {
       lines.push(`- _...and ${fixable.length - 10} more_`);
@@ -7337,7 +7871,7 @@ function buildCommentBody(report) {
   }
   lines.push("---");
   lines.push(
-    `<sub>auditfix v${VERSION} | ${report.metadata.advisorySource} | ${report.metadata.totalPackages} packages scanned | confidence: ${report.metadata.confidence} | ${report.metadata.scanDurationMs}ms</sub>`
+    `<sub>auditfix v${VERSION} | ${escapeMarkdown(report.metadata.advisorySource)} | ${report.metadata.totalPackages} packages scanned | confidence: ${escapeMarkdown(report.metadata.confidence)} | ${report.metadata.scanDurationMs}ms</sub>`
   );
   return lines.join("\n");
 }
@@ -7400,7 +7934,136 @@ async function postPrComment(report, options) {
 }
 
 // src/core/notify/webhook.ts
+import * as dns from "dns/promises";
+import * as net from "net";
+var ALLOWED_PORTS = /* @__PURE__ */ new Set([80, 443]);
+var ALLOWED_PROTOCOLS = /* @__PURE__ */ new Set(["http:", "https:"]);
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  const bare = ip.includes("%") ? ip.slice(0, ip.indexOf("%")) : ip;
+  const family = net.isIP(bare);
+  if (family === 4) return isPrivateIPv4(bare);
+  if (family === 6) return isPrivateIPv6(bare);
+  return true;
+}
+function isPrivateIPv4(ip) {
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return true;
+  const [a, b] = parts;
+  if (a === 0) return true;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0) return true;
+  if (a === 198 && (b === 18 || b === 19 || b === 51)) return true;
+  if (a === 203 && b === 0) return true;
+  if (a >= 224) return true;
+  return false;
+}
+function isPrivateIPv6(ip) {
+  const lower = ip.toLowerCase();
+  if (lower === "::" || lower === "::1" || lower === "0:0:0:0:0:0:0:0" || lower === "0:0:0:0:0:0:0:1") return true;
+  const mapped = /^::ffff:([0-9a-f:.]+)$/i.exec(ip);
+  if (mapped) {
+    const inner = mapped[1];
+    if (net.isIPv4(inner)) return isPrivateIPv4(inner);
+    const hexParts = inner.split(":");
+    if (hexParts.length === 2 && /^[0-9a-f]{1,4}$/i.test(hexParts[0]) && /^[0-9a-f]{1,4}$/i.test(hexParts[1])) {
+      const hi = parseInt(hexParts[0], 16);
+      const lo = parseInt(hexParts[1], 16);
+      const a = hi >> 8 & 255;
+      const b = hi & 255;
+      const c = lo >> 8 & 255;
+      const d = lo & 255;
+      return isPrivateIPv4(`${a}.${b}.${c}.${d}`);
+    }
+    return true;
+  }
+  const compat = /^::([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/.exec(lower);
+  if (compat && net.isIPv4(compat[1])) return isPrivateIPv4(compat[1]);
+  const groups = expandIPv6(lower);
+  if (!groups) return true;
+  const first = groups[0];
+  if ((first & 65024) === 64512) return true;
+  if ((first & 65472) === 65152) return true;
+  if ((first & 65280) === 65280) return true;
+  if (first === 8193 && groups[1] === 3512) return true;
+  if (groups.every((g) => g === 0)) return true;
+  return false;
+}
+function expandIPv6(ip) {
+  let head;
+  let tail;
+  if (ip.includes("::")) {
+    const parts = ip.split("::");
+    if (parts.length !== 2) return null;
+    head = parts[0] ? parts[0].split(":") : [];
+    tail = parts[1] ? parts[1].split(":") : [];
+    const missing = 8 - head.length - tail.length;
+    if (missing < 0) return null;
+    const fill = new Array(missing).fill("0");
+    const all = [...head, ...fill, ...tail];
+    return all.map((g) => parseInt(g || "0", 16));
+  }
+  const groups = ip.split(":");
+  if (groups.length !== 8) return null;
+  return groups.map((g) => parseInt(g || "0", 16));
+}
+async function isValidWebhookUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { valid: false, reason: "Invalid URL" };
+  }
+  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    return { valid: false, reason: `Protocol ${parsed.protocol} not allowed` };
+  }
+  if (parsed.port !== "") {
+    const portNum = Number(parsed.port);
+    if (!ALLOWED_PORTS.has(portNum)) {
+      return { valid: false, reason: `Port ${parsed.port} not allowed` };
+    }
+  }
+  const hostname = parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+  if (!hostname) {
+    return { valid: false, reason: "Missing hostname" };
+  }
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) {
+      return { valid: false, reason: `Resolved address ${hostname} is in a private/reserved range` };
+    }
+    return { valid: true };
+  }
+  if (hostname.toLowerCase() === "localhost") {
+    return { valid: false, reason: "Hostname localhost is not allowed" };
+  }
+  try {
+    const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    if (addresses.length === 0) {
+      return { valid: false, reason: `DNS resolution returned no addresses for ${hostname}` };
+    }
+    for (const addr of addresses) {
+      if (isPrivateIp(addr.address)) {
+        return { valid: false, reason: `Resolved address ${addr.address} is in a private/reserved range` };
+      }
+    }
+    return { valid: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { valid: false, reason: `DNS resolution failed: ${msg}` };
+  }
+}
 async function sendWebhook(webhookUrl, report, projectName) {
+  const validation = await isValidWebhookUrl(webhookUrl);
+  if (!validation.valid) {
+    const reason = validation.reason ?? "Invalid webhook URL";
+    warn(`Webhook URL rejected: ${reason}`);
+    return { success: false, error: `Webhook URL rejected: ${reason}` };
+  }
   const platform = detectPlatform(webhookUrl);
   const body = platform === "slack" ? buildSlackPayload(report, projectName) : platform === "teams" ? buildTeamsPayload(report, projectName) : platform === "discord" ? buildDiscordPayload(report, projectName) : buildGenericPayload(report, projectName);
   try {
@@ -7422,9 +8085,13 @@ async function sendWebhook(webhookUrl, report, projectName) {
   }
 }
 function detectPlatform(url) {
-  if (url.includes("hooks.slack.com") || url.includes("hooks.slack-gov.com")) return "slack";
-  if (url.includes("webhook.office.com") || url.includes("outlook.office.com")) return "teams";
-  if (url.includes("discord.com/api/webhooks")) return "discord";
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    if (hostname === "hooks.slack.com" || hostname === "hooks.slack-gov.com") return "slack";
+    if (hostname.endsWith(".webhook.office.com") || hostname === "webhook.office.com" || hostname.endsWith(".outlook.office.com") || hostname === "outlook.office.com") return "teams";
+    if (hostname === "discord.com" || hostname === "discordapp.com") return "discord";
+  } catch {
+  }
   return "generic";
 }
 function severityColor(report) {
@@ -8068,14 +8735,7 @@ var chalk = createChalk();
 var chalkStderr = createChalk({ level: stderrColor ? stderrColor.level : 0 });
 var source_default = chalk;
 
-// src/cli/output/terminal.ts
-var SEVERITY_COLORS = {
-  critical: source_default.bgRed.white.bold,
-  high: source_default.red.bold,
-  medium: source_default.yellow,
-  low: source_default.dim,
-  info: source_default.gray
-};
+// src/core/exit-code.ts
 function getExitCode(report) {
   if (report.metadata.confidence === "UNRELIABLE") return 2;
   const hasProdVulns = report.vulnerabilities.some(
@@ -8097,6 +8757,15 @@ function getExitCodeForStrategy(report, strategy) {
       return getExitCode(report);
   }
 }
+
+// src/cli/output/terminal.ts
+var SEVERITY_COLORS = {
+  critical: source_default.bgRed.white.bold,
+  high: source_default.red.bold,
+  medium: source_default.yellow,
+  low: source_default.dim,
+  info: source_default.gray
+};
 
 // action/index.ts
 function encodeWorkflowCommand(value) {
