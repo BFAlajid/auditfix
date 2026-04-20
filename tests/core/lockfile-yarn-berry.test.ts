@@ -102,4 +102,74 @@ __metadata:
     });
     expect(graph.has('@scope/pkg@1.2.3')).toBe(true);
   });
+
+  // M-S3: oversized request key is skipped, parse still succeeds.
+  it('skips oversized request keys (>MAX_KEY_LENGTH) with warning', () => {
+    const longRange = '^' + '1.'.repeat(800) + '0';
+    const content = `
+__metadata:
+  version: 6
+
+"lodash@npm:^4.17.20":
+  version: 4.17.20
+  resolution: "lodash@npm:4.17.20"
+  checksum: sha512-abc
+
+"huge-pkg@npm:${longRange}":
+  version: 1.0.0
+  resolution: "huge-pkg@npm:1.0.0"
+  checksum: sha512-huge
+`;
+    const { graph, skipped } = parseYarnBerryLockfile(content, {
+      dependencies: { lodash: '^4.17.20' },
+    });
+    // Real package still parsed.
+    expect(graph.has('lodash@4.17.20')).toBe(true);
+    // Oversized-keyed entry was skipped.
+    expect(graph.has('huge-pkg@1.0.0')).toBe(false);
+    expect(skipped.some(s => s.reason === 'unparseable')).toBe(true);
+  });
+
+  // C-B4 mirror: optionalDependencies must NOT be marked as production.
+  it('does not mark optionalDependencies as production', () => {
+    const content = `
+__metadata:
+  version: 6
+
+"fsevents@npm:^2.3.0":
+  version: 2.3.3
+  resolution: "fsevents@npm:2.3.3"
+  checksum: sha512-fake
+`;
+    const { graph } = parseYarnBerryLockfile(content, {
+      optionalDependencies: { fsevents: '^2.3.0' },
+    });
+    const fsevents = graph.get('fsevents@2.3.3')!;
+    expect(fsevents).toBeDefined();
+    expect(fsevents.isOptional).toBe(true);
+    expect(fsevents.isProduction).toBe(false);
+  });
+
+  // Fix 6: resolveRoot returns null when exact range misses — no longer
+  // falls back to arbitrary first graph entry with matching name.
+  it('returns null when manifest range does not match any lockfile entry', () => {
+    const content = `
+__metadata:
+  version: 6
+
+"express@npm:^4.17.1":
+  version: 4.17.1
+  resolution: "express@npm:4.17.1"
+  checksum: sha512-ex
+`;
+    // Manifest declares express@^5.0.0; lockfile only has the ^4.17.1 range.
+    const { graph } = parseYarnBerryLockfile(content, {
+      dependencies: { express: '^5.0.0' },
+    });
+    const express = graph.get('express@4.17.1')!;
+    expect(express).toBeDefined();
+    // Resolution missed → express falls back to dev classification.
+    expect(express.isProduction).toBe(false);
+    expect(express.isDev).toBe(true);
+  });
 });
