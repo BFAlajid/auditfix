@@ -122,6 +122,43 @@ async function findExistingComment(
 
 // ── Markdown formatting ─────────────────────────────────────────────────────
 
+/**
+ * Escape user-controlled strings for safe embedding in GitHub-flavored markdown.
+ *
+ * Mitigates:
+ *   - Table-break:     `|` in cells.
+ *   - Code-break:      backtick inside inline code spans.
+ *   - Heading / list injection: newlines (`\n`, `\r`).
+ *   - Link injection:  `[` `]` `(` `)`.
+ *   - Mention spam:    `@username` → `@\u200Busername` (zero-width space).
+ *   - HTML/comment injection: `<` `>` → `&lt;` `&gt;` (also neutralizes `<!-- -->` comment attempts).
+ *   - Backslash escape collisions: leading `\\`.
+ */
+export function escapeMarkdown(s: string): string {
+  if (s == null) return '';
+  const str = String(s);
+  let out = '';
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    switch (ch) {
+      case '\\': out += '\\\\'; break;
+      case '`':  out += '\\`'; break;
+      case '|':  out += '\\|'; break;
+      case '[':  out += '\\['; break;
+      case ']':  out += '\\]'; break;
+      case '(':  out += '\\('; break;
+      case ')':  out += '\\)'; break;
+      case '<':  out += '&lt;'; break;
+      case '>':  out += '&gt;'; break;
+      case '@':  out += '@\u200B'; break; // zero-width space defeats @mention autolink
+      case '\r': out += ' '; break;
+      case '\n': out += ' '; break;
+      default:   out += ch;
+    }
+  }
+  return out;
+}
+
 function severityEmoji(label: string): string {
   switch (label) {
     case 'critical': return '🔴';
@@ -185,9 +222,11 @@ function buildCommentBody(report: AuditReport): string {
     lines.push('| Package | Version | Severity | Score | Fix |');
     lines.push('| --- | --- | --- | --- | --- |');
     for (const v of top) {
-      const fix = v.risk.factors.fixVersion ?? '—';
-      const sev = `${severityEmoji(v.risk.label)} ${v.risk.label}`;
-      lines.push(`| \`${v.match.package}\` | ${v.match.installedVersion} | ${sev} | ${v.risk.score} | ${fix} |`);
+      const fix = v.risk.factors.fixVersion ? escapeMarkdown(v.risk.factors.fixVersion) : '—';
+      const sev = `${severityEmoji(v.risk.label)} ${escapeMarkdown(v.risk.label)}`;
+      const pkg = escapeMarkdown(v.match.package);
+      const ver = escapeMarkdown(v.match.installedVersion);
+      lines.push(`| \`${pkg}\` | ${ver} | ${sev} | ${v.risk.score} | ${fix} |`);
     }
     if (total > 10) {
       lines.push('');
@@ -204,7 +243,10 @@ function buildCommentBody(report: AuditReport): string {
     lines.push(`${fixable.length} ${fixable.length === 1 ? 'vulnerability has' : 'vulnerabilities have'} a known fix:`);
     lines.push('');
     for (const v of fixable.slice(0, 10)) {
-      lines.push(`- \`${v.match.package}\` ${v.match.installedVersion} → **${v.risk.factors.fixVersion}**`);
+      const pkg = escapeMarkdown(v.match.package);
+      const ver = escapeMarkdown(v.match.installedVersion);
+      const fix = escapeMarkdown(v.risk.factors.fixVersion ?? '');
+      lines.push(`- \`${pkg}\` ${ver} → **${fix}**`);
     }
     if (fixable.length > 10) {
       lines.push(`- _...and ${fixable.length - 10} more_`);
@@ -215,9 +257,9 @@ function buildCommentBody(report: AuditReport): string {
   // Footer
   lines.push('---');
   lines.push(
-    `<sub>auditfix v${VERSION} | ${report.metadata.advisorySource} | ` +
+    `<sub>auditfix v${VERSION} | ${escapeMarkdown(report.metadata.advisorySource)} | ` +
     `${report.metadata.totalPackages} packages scanned | ` +
-    `confidence: ${report.metadata.confidence} | ` +
+    `confidence: ${escapeMarkdown(report.metadata.confidence)} | ` +
     `${report.metadata.scanDurationMs}ms</sub>`,
   );
 

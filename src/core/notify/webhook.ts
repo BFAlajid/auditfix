@@ -2,6 +2,8 @@
  * Webhook/Slack notification sender.
  * Posts audit results to a webhook URL (Slack-compatible or generic).
  */
+import * as dns from 'node:dns/promises';
+import * as net from 'node:net';
 import type { AuditReport } from '../../types/report.js';
 import * as logger from '../../utils/logger.js';
 
@@ -10,6 +12,195 @@ export type WebhookResult = {
   statusCode?: number;
   error?: string;
 };
+
+export type WebhookValidationResult = {
+  valid: boolean;
+  reason?: string;
+};
+
+const ALLOWED_PORTS = new Set([80, 443]);
+const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
+
+/**
+ * Classify an IP string (IPv4 or IPv6) as private/reserved.
+ * Covers loopback, RFC1918, link-local, CGNAT, IPv6 ULA/link-local,
+ * unspecified, and IPv4-mapped IPv6 addresses.
+ */
+export function isPrivateIp(ip: string): boolean {
+  if (!ip) return true;
+  // Strip zone-id from IPv6 link-local (e.g., fe80::1%eth0 -> fe80::1)
+  const bare = ip.includes('%') ? ip.slice(0, ip.indexOf('%')) : ip;
+  const family = net.isIP(bare);
+  if (family === 4) return isPrivateIPv4(bare);
+  if (family === 6) return isPrivateIPv6(bare);
+  // Not a valid IP — treat as unsafe (defense-in-depth).
+  return true;
+}
+
+function isPrivateIPv4(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return true;
+  const [a, b] = parts as [number, number, number, number];
+  // 0.0.0.0/8 — "this network" / unspecified
+  if (a === 0) return true;
+  // 10.0.0.0/8 — RFC1918
+  if (a === 10) return true;
+  // 127.0.0.0/8 — loopback
+  if (a === 127) return true;
+  // 169.254.0.0/16 — link-local
+  if (a === 169 && b === 254) return true;
+  // 172.16.0.0/12 — RFC1918 (172.16.0.0 – 172.31.255.255)
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 192.168.0.0/16 — RFC1918
+  if (a === 192 && b === 168) return true;
+  // 100.64.0.0/10 — CGNAT (100.64.0.0 – 100.127.255.255)
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  // 192.0.0.0/24, 192.0.2.0/24 (TEST-NET-1), 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224+ multicast/reserved
+  if (a === 192 && b === 0) return true;
+  if (a === 198 && (b === 18 || b === 19 || b === 51)) return true;
+  if (a === 203 && b === 0) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+function isPrivateIPv6(ip: string): boolean {
+  // Normalize to lowercase hex groups. Rely on net.isIP having already validated.
+  const lower = ip.toLowerCase();
+
+  // Unspecified ::  and loopback ::1
+  if (lower === '::' || lower === '::1' || lower === '0:0:0:0:0:0:0:0' || lower === '0:0:0:0:0:0:0:1') return true;
+
+  // IPv4-mapped IPv6: ::ffff:a.b.c.d or ::ffff:X:Y  → classify underlying IPv4.
+  // Common textual forms: "::ffff:127.0.0.1", "::ffff:7f00:1"
+  const mapped = /^::ffff:([0-9a-f:.]+)$/i.exec(ip);
+  if (mapped) {
+    const inner = mapped[1];
+    if (net.isIPv4(inner)) return isPrivateIPv4(inner);
+    // Hex form ::ffff:X:Y — convert 2 hex groups to IPv4 octets.
+    const hexParts = inner.split(':');
+    if (hexParts.length === 2 && /^[0-9a-f]{1,4}$/i.test(hexParts[0]) && /^[0-9a-f]{1,4}$/i.test(hexParts[1])) {
+      const hi = parseInt(hexParts[0], 16);
+      const lo = parseInt(hexParts[1], 16);
+      const a = (hi >> 8) & 0xff;
+      const b = hi & 0xff;
+      const c = (lo >> 8) & 0xff;
+      const d = lo & 0xff;
+      return isPrivateIPv4(`${a}.${b}.${c}.${d}`);
+    }
+    return true;
+  }
+
+  // IPv4-compatible IPv6: ::a.b.c.d (legacy, deprecated) — treat underlying IPv4.
+  const compat = /^::([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/.exec(lower);
+  if (compat && net.isIPv4(compat[1])) return isPrivateIPv4(compat[1]);
+
+  // Expand to full 8 groups for prefix checks.
+  const groups = expandIPv6(lower);
+  if (!groups) return true;
+  const first = groups[0];
+
+  // fc00::/7 — Unique Local Addresses (fc00 – fdff)
+  if ((first & 0xfe00) === 0xfc00) return true;
+  // fe80::/10 — link-local (fe80 – febf)
+  if ((first & 0xffc0) === 0xfe80) return true;
+  // ff00::/8 — multicast
+  if ((first & 0xff00) === 0xff00) return true;
+  // 2001:db8::/32 — documentation
+  if (first === 0x2001 && groups[1] === 0x0db8) return true;
+  // ::/128 already handled above; block any remaining all-zeros with trailing bits.
+  if (groups.every((g) => g === 0)) return true;
+
+  return false;
+}
+
+function expandIPv6(ip: string): number[] | null {
+  // Handle :: shorthand
+  let head: string[];
+  let tail: string[];
+  if (ip.includes('::')) {
+    const parts = ip.split('::');
+    if (parts.length !== 2) return null;
+    head = parts[0] ? parts[0].split(':') : [];
+    tail = parts[1] ? parts[1].split(':') : [];
+    const missing = 8 - head.length - tail.length;
+    if (missing < 0) return null;
+    const fill = new Array(missing).fill('0');
+    const all = [...head, ...fill, ...tail];
+    return all.map((g) => parseInt(g || '0', 16));
+  }
+  const groups = ip.split(':');
+  if (groups.length !== 8) return null;
+  return groups.map((g) => parseInt(g || '0', 16));
+}
+
+/**
+ * Validate a webhook URL against SSRF attacks.
+ * Parses the URL, checks the scheme and port, then resolves the hostname via DNS
+ * and rejects if any resolved address is private/reserved. Done at fetch-time
+ * to mitigate DNS rebinding.
+ *
+ * Returns a reason string when invalid so callers/logs can explain the rejection.
+ */
+export async function isValidWebhookUrl(url: string): Promise<WebhookValidationResult> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { valid: false, reason: 'Invalid URL' };
+  }
+
+  // Scheme: only http(s)
+  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    return { valid: false, reason: `Protocol ${parsed.protocol} not allowed` };
+  }
+
+  // Port: explicit port must be 80 or 443. Empty string means default port for scheme.
+  if (parsed.port !== '') {
+    const portNum = Number(parsed.port);
+    if (!ALLOWED_PORTS.has(portNum)) {
+      return { valid: false, reason: `Port ${parsed.port} not allowed` };
+    }
+  }
+
+  // Hostname: strip IPv6 brackets if present.
+  const hostname = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+
+  if (!hostname) {
+    return { valid: false, reason: 'Missing hostname' };
+  }
+
+  // If the hostname is a literal IP, check it directly (no DNS).
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) {
+      return { valid: false, reason: `Resolved address ${hostname} is in a private/reserved range` };
+    }
+    return { valid: true };
+  }
+
+  // Cheap textual reject: localhost alias (case-insensitive).
+  if (hostname.toLowerCase() === 'localhost') {
+    return { valid: false, reason: 'Hostname localhost is not allowed' };
+  }
+
+  // DNS resolution — reject if ANY resolved address is private.
+  try {
+    const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+    if (addresses.length === 0) {
+      return { valid: false, reason: `DNS resolution returned no addresses for ${hostname}` };
+    }
+    for (const addr of addresses) {
+      if (isPrivateIp(addr.address)) {
+        return { valid: false, reason: `Resolved address ${addr.address} is in a private/reserved range` };
+      }
+    }
+    return { valid: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { valid: false, reason: `DNS resolution failed: ${msg}` };
+  }
+}
 
 /**
  * Send audit results to a webhook URL.
@@ -20,6 +211,14 @@ export async function sendWebhook(
   report: AuditReport,
   projectName?: string,
 ): Promise<WebhookResult> {
+  // SSRF guard — must run before fetch.
+  const validation = await isValidWebhookUrl(webhookUrl);
+  if (!validation.valid) {
+    const reason = validation.reason ?? 'Invalid webhook URL';
+    logger.warn(`Webhook URL rejected: ${reason}`);
+    return { success: false, error: `Webhook URL rejected: ${reason}` };
+  }
+
   const platform = detectPlatform(webhookUrl);
   const body = platform === 'slack' ? buildSlackPayload(report, projectName)
     : platform === 'teams' ? buildTeamsPayload(report, projectName)
