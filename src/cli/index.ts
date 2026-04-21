@@ -13,6 +13,9 @@ import { LOCKFILE_NAMES } from '../core/constants.js';
 import { renderJsonReport } from './output/json.js';
 import { renderSarifReport, renderSarifDiffReport } from './output/sarif.js';
 import { generateSbom } from './output/sbom.js';
+import { generateSPDX } from './output/spdx.js';
+import { generateCSAFVEX } from './output/csaf-vex.js';
+import { renderMermaid, renderDot, renderHTML } from './output/graph-viz.js';
 import { addToAllowList } from '../core/allowlist/local.js';
 import { planFixes } from '../core/fixer/safe-update.js';
 import { applyFixes } from '../core/fixer/lockfile-writer.js';
@@ -59,7 +62,8 @@ program
   .option('--fix', 'Auto-fix safe (non-breaking) updates', false)
   .option('--json', 'Output as JSON', false)
   .option('--sarif', 'Output as SARIF v2.1.0 JSON (for GitHub Code Scanning)', false)
-  .option('--sbom', 'Generate CycloneDX 1.5 SBOM (JSON)', false)
+  .option('--sbom', 'Generate SBOM (JSON) and exit', false)
+  .addOption(new Option('--sbom-format <format>', 'SBOM format').choices(['cyclonedx', 'spdx']).default('cyclonedx'))
   .option('--scan-scripts', 'Scan for suspicious install scripts', false)
   .option('--remediate', 'Show guided remediation plan', false)
   .option('--create-pr', 'Create a GitHub PR with fixes (requires gh CLI)', false)
@@ -70,7 +74,11 @@ program
   .option('--check-typosquats', 'Detect potential typosquatting packages', false)
   .option('--check-provenance', 'Check npm package provenance attestations', false)
   .option('--scan-behavior', 'Deep scan package source for suspicious behavior patterns', false)
-  .option('--vex', 'Generate OpenVEX document from scan results', false)
+  .option('--vex', 'Generate VEX document from scan results', false)
+  .addOption(new Option('--vex-format <format>', 'VEX format').choices(['openvex', 'csaf']).default('openvex'))
+  .addOption(new Option('--graph <format>', 'Emit dependency graph visualization').choices(['mermaid', 'dot', 'html']))
+  .option('--graph-out <path>', 'Write graph output to file instead of stdout')
+  .option('--ghsa-token <token>', 'GitHub token for GHSA GraphQL enrichment (falls back to GITHUB_TOKEN/GH_TOKEN)')
   .option('--sarif-baseline <path>', 'SARIF diff mode: only output NEW vulns not in baseline JSON report')
   .option('--pr-comment', 'Post scan results as a GitHub PR comment (requires GITHUB_TOKEN)', false)
   .option('--policy <path>', 'Path to policy file (auto-detects .auditfix-policy.yml)')
@@ -153,10 +161,32 @@ program
     }
 
     try {
-      // --sbom: generate CycloneDX SBOM and exit (no audit needed)
+      // --sbom: generate SBOM (CycloneDX or SPDX) and exit (no audit needed)
       if (options.sbom) {
         const lockfileResult = detectAndParseLockfile(options.dir);
-        console.log(generateSbom(lockfileResult.graph, VERSION, readProjectName(options.dir)));
+        const projName = readProjectName(options.dir) ?? 'project';
+        if (options.sbomFormat === 'spdx') {
+          // SPDX accepts AuditReport + projectName + toolVersion — we don't
+          // have a report yet (sbom is pre-audit), so build a minimal stub
+          // with the real metadata shape from src/types/report.ts.
+          const stubReport: AuditReport = {
+            vulnerabilities: [],
+            ignored: [],
+            metadata: {
+              totalPackages: lockfileResult.graph.size,
+              skippedPackages: 0,
+              skippedReasons: [],
+              advisorySource: 'n/a',
+              advisoryCount: 0,
+              confidence: 'HIGH',
+              scanDurationMs: 0,
+              lockfileType: lockfileResult.type,
+            },
+          };
+          console.log(generateSPDX(stubReport, projName, VERSION));
+        } else {
+          console.log(generateSbom(lockfileResult.graph, VERSION, projName));
+        }
         process.exit(0);
       }
 
@@ -185,6 +215,7 @@ program
         severityThreshold: config.severity,
         workspace: options.workspace,
         noCache: options.cache === false,
+        ghsaToken: options.ghsaToken,
       });
 
       // CI mode forces JSON output
@@ -328,11 +359,44 @@ program
         }
       }
 
-      // Generate VEX document if requested
+      // Generate VEX document if requested (OpenVEX default, CSAF alternative)
       if (options.vex) {
-        const vexDoc = generateVex(report, VERSION, readProjectName(options.dir));
+        const projName = readProjectName(options.dir) ?? 'project';
+        const vexDoc = options.vexFormat === 'csaf'
+          ? generateCSAFVEX(report, projName, VERSION)
+          : generateVex(report, VERSION, projName);
         console.log('');
         console.log(vexDoc);
+      }
+
+      // Graph visualization output
+      if (options.graph) {
+        const projName = readProjectName(options.dir) ?? 'project';
+        const lockfileResult = detectAndParseLockfile(options.dir);
+        const attached = {
+          ...report,
+          graph: lockfileResult.graph,
+          rootKeys: Array.from(lockfileResult.graph.values())
+            .filter((n) => n.depth === 0)
+            .map((n) => `${n.name}@${n.version}`),
+        };
+        let graphOut: string;
+        if (options.graph === 'dot') graphOut = renderDot(attached);
+        else if (options.graph === 'html') graphOut = renderHTML(attached, projName);
+        else graphOut = renderMermaid(attached);
+        if (options.graphOut) {
+          const outPath = path.resolve(options.graphOut);
+          if (!outPath.startsWith(dir + path.sep) && outPath !== dir) {
+            logger.error('Graph output path must be within the project directory');
+            process.exit(2);
+          }
+          const { writeFileSync } = await import('node:fs');
+          writeFileSync(outPath, graphOut, 'utf-8');
+          logger.info(`Graph written to ${outPath}`);
+        } else {
+          console.log('');
+          console.log(graphOut);
+        }
       }
 
       // Send webhook notification if URL provided

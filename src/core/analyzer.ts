@@ -21,6 +21,7 @@ export type AnalyzeOptions = {
   severityThreshold?: RiskScore['label'];
   workspace?: string; // filter to a specific workspace
   noCache?: boolean;  // bypass advisory cache
+  ghsaToken?: string; // optional GHSA GraphQL enrichment token
 };
 
 export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
@@ -56,7 +57,7 @@ export async function analyze(options: AnalyzeOptions): Promise<AuditReport> {
   let advisories: Map<string, import('../types/advisory.js').Advisory[]>;
 
   try {
-    const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache });
+    const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache, ghsaToken: options.ghsaToken });
     advisories = resolved.advisories;
     // TODO(resolver-sourceId): prefer `resolved.sourceId` for any downstream
     // logic that needs to branch on origin (telemetry, confidence rules, etc.).

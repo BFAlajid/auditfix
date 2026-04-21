@@ -32222,7 +32222,7 @@ var AdvisoryResolutionError = class extends Error {
 };
 async function resolveAdvisoriesWithCache(graph, options) {
   if (options?.noCache) {
-    return resolveAdvisories(graph);
+    return resolveAdvisories(graph, { ghsaToken: options?.ghsaToken });
   }
   const packageNames = [];
   const seen = /* @__PURE__ */ new Set();
@@ -32246,7 +32246,7 @@ async function resolveAdvisoriesWithCache(graph, options) {
     }
     if (cached.freshness === "stale") {
       info(`All ${packageNames.length} packages served from stale cache (1-4h), refreshing in background`);
-      resolveAdvisories(graph).catch((err) => {
+      resolveAdvisories(graph, { ghsaToken: options?.ghsaToken }).catch((err) => {
         debug(`Background cache refresh failed: ${err}`);
       });
       return {
@@ -32258,7 +32258,7 @@ async function resolveAdvisoriesWithCache(graph, options) {
       };
     }
   }
-  return resolveAdvisories(graph);
+  return resolveAdvisories(graph, { ghsaToken: options?.ghsaToken });
 }
 function getCachedAdvisoriesForGraph(graph) {
   const result = /* @__PURE__ */ new Map();
@@ -33095,7 +33095,7 @@ async function analyze(options) {
   let advisoryCount;
   let advisories;
   try {
-    const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache });
+    const resolved = await resolveAdvisoriesWithCache(lockfileResult.graph, { noCache: options.noCache, ghsaToken: options.ghsaToken });
     advisories = resolved.advisories;
     advisorySource = resolved.source;
     confidence = resolved.confidence;

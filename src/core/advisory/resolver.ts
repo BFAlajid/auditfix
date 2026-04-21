@@ -276,10 +276,10 @@ export class AdvisoryResolutionError extends Error {
  */
 export async function resolveAdvisoriesWithCache(
   graph: DependencyGraph,
-  options?: { noCache?: boolean },
+  options?: { noCache?: boolean; ghsaToken?: string },
 ): Promise<ResolverResult> {
   if (options?.noCache) {
-    return resolveAdvisories(graph);
+    return resolveAdvisories(graph, { ghsaToken: options?.ghsaToken });
   }
 
   // Collect unique package names
@@ -309,7 +309,7 @@ export async function resolveAdvisoriesWithCache(
     if (cached.freshness === 'stale') {
       logger.info(`All ${packageNames.length} packages served from stale cache (1-4h), refreshing in background`);
       // Trigger background refresh (don't await)
-      resolveAdvisories(graph).catch((err) => {
+      resolveAdvisories(graph, { ghsaToken: options?.ghsaToken }).catch((err) => {
         logger.debug(`Background cache refresh failed: ${err}`);
       });
       return {
@@ -323,7 +323,7 @@ export async function resolveAdvisoriesWithCache(
   }
 
   // Cold or missing — full network resolution
-  return resolveAdvisories(graph);
+  return resolveAdvisories(graph, { ghsaToken: options?.ghsaToken });
 }
 
 /**
