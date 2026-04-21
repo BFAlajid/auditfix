@@ -2,9 +2,14 @@
  * EPSS (Exploit Prediction Scoring System) integration.
  * Queries FIRST.org API for exploit probability scores.
  * Also checks CISA KEV (Known Exploited Vulnerabilities) catalog.
+ *
+ * Hardening: both EPSS and KEV flow through fetchJsonWithValidation which
+ * enforces size caps (10 MB EPSS, 20 MB KEV), content-type checks, and
+ * abort timeouts. The undici pool dispatcher is opted-in via {pool:true}
+ * when available (graceful fallback to global fetch otherwise).
  */
 import * as logger from '../../utils/logger.js';
-import { getPooledDispatcher } from '../../utils/fetch.js';
+import { fetchJsonWithValidation, FetchValidationError } from '../../utils/fetch.js';
 
 export type EpssScore = {
   cve: string;
@@ -20,8 +25,8 @@ export type KevEntry = {
   knownRansomwareCampaignUse: string;
 };
 
-const EPSS_MAX_BYTES = 10 * 1024 * 1024;   // 10MB — worst-case batch of 50 CVEs is ~20KB
-const KEV_MAX_BYTES = 20 * 1024 * 1024;    // 20MB — catalog is ~2MB today
+const EPSS_MAX_BYTES = 10 * 1024 * 1024;
+const KEV_MAX_BYTES = 20 * 1024 * 1024;
 const EPSS_TIMEOUT_MS = 30_000;
 const KEV_TIMEOUT_MS = 30_000;
 const EPSS_BATCH_SIZE = 50;
@@ -49,7 +54,7 @@ function makeKevCache(ttlMs: number): KevCacheState {
   return state;
 }
 
-const kevState: KevCacheState = makeKevCache(4 * 60 * 60 * 1000); // 4 hours
+const kevState: KevCacheState = makeKevCache(4 * 60 * 60 * 1000);
 
 /** Reset the in-memory KEV cache. Intended for tests and per-analyze-call freshness. */
 export function resetKevCache(): void {
@@ -68,7 +73,6 @@ async function pMap<T, R>(
   const results: R[] = new Array(items.length);
   let cursor = 0;
   const workerCount = Math.max(1, Math.min(concurrency, items.length));
-
   async function worker(): Promise<void> {
     while (true) {
       const index = cursor++;
@@ -76,7 +80,6 @@ async function pMap<T, R>(
       results[index] = await fn(items[index], index);
     }
   }
-
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
 }
@@ -89,11 +92,16 @@ async function fetchEpssBatch(batch: string[]): Promise<EpssApiResponse['data']>
   const param = batch.join(',');
   const url = `https://api.first.org/data/v1/epss?cve=${param}`;
   try {
-    const data = await fetchJsonWithValidation<EpssApiResponse>(url, {
-      maxBytes: EPSS_MAX_BYTES,
-      timeoutMs: EPSS_TIMEOUT_MS,
-      contentType: 'application/json',
-    });
+    const data = await fetchJsonWithValidation<EpssApiResponse>(
+      url,
+      {},
+      {
+        maxSize: EPSS_MAX_BYTES,
+        timeoutMs: EPSS_TIMEOUT_MS,
+        expectedContentType: 'application/json',
+        pool: true,
+      },
+    );
     return data.data ?? [];
   } catch (err) {
     if (err instanceof FetchValidationError) {
@@ -113,21 +121,10 @@ export async function fetchEpssScores(cveIds: string[]): Promise<Map<string, Eps
   const results = new Map<string, EpssScore>();
   if (cveIds.length === 0) return results;
 
-  // EPSS API supports comma-separated CVEs, batch in groups of 50
-  const BATCH_SIZE = 50;
-  for (let i = 0; i < cveIds.length; i += BATCH_SIZE) {
-    const batch = cveIds.slice(i, i + BATCH_SIZE);
-    try {
-      const param = batch.join(',');
-      const dispatcher = await getPooledDispatcher();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const init: any = { signal: AbortSignal.timeout(10_000) };
-      if (dispatcher) init.dispatcher = dispatcher;
-      const response = await fetch(
-        `https://api.first.org/data/v1/epss?cve=${param}`,
-        init,
-      );
-      if (!response.ok) continue;
+  const batches: string[][] = [];
+  for (let i = 0; i < cveIds.length; i += EPSS_BATCH_SIZE) {
+    batches.push(cveIds.slice(i, i + EPSS_BATCH_SIZE));
+  }
 
   const batchResults = await pMap(batches, fetchEpssBatch, EPSS_BATCH_CONCURRENCY);
 
@@ -152,18 +149,18 @@ export async function fetchKevCatalog(): Promise<Set<string>> {
   if (kevState.cache && Date.now() - kevState.cachedAt < kevState.ttlMs) {
     return kevState.cache;
   }
-
   try {
-    const dispatcher = await getPooledDispatcher();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const init: any = { signal: AbortSignal.timeout(15_000) };
-    if (dispatcher) init.dispatcher = dispatcher;
-    const response = await fetch(
+    const data = await fetchJsonWithValidation<{ vulnerabilities: Array<{ cveID: string }> }>(
       'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
-      init,
+      {},
+      {
+        maxSize: KEV_MAX_BYTES,
+        timeoutMs: KEV_TIMEOUT_MS,
+        expectedContentType: 'application/json',
+        pool: true,
+      },
     );
-
-    const next = new Set((data.vulnerabilities ?? []).map((v) => v.cveID));
+    const next = new Set<string>((data.vulnerabilities ?? []).map((v) => v.cveID));
     kevState.cache = next;
     kevState.cachedAt = Date.now();
     logger.debug(`CISA KEV loaded: ${next.size} entries`);
@@ -174,7 +171,7 @@ export async function fetchKevCatalog(): Promise<Set<string>> {
     } else {
       logger.debug(`CISA KEV fetch failed: ${err instanceof Error ? err.message : err}`);
     }
-    return kevState.cache ?? new Set();
+    return kevState.cache ?? new Set<string>();
   }
 }
 
@@ -189,7 +186,7 @@ export function isInKev(cveId: string, kevSet: Set<string>): boolean {
  * Extract CVE IDs from advisory aliases.
  */
 export function extractCveIds(aliases: string[]): string[] {
-  return aliases.filter(a => a.startsWith('CVE-'));
+  return aliases.filter((a) => a.startsWith('CVE-'));
 }
 
 /**
@@ -201,13 +198,11 @@ export function computeExploitScore(
   epssScores: Map<string, EpssScore>,
   kevSet: Set<string>,
 ): { score: number; inKev: boolean; epssMax: number | null } {
-  // CISA KEV is the highest signal — actively exploited
-  const inKev = cveIds.some(id => kevSet.has(id));
+  const inKev = cveIds.some((id) => kevSet.has(id));
   if (inKev) {
     return { score: 20, inKev: true, epssMax: 1.0 };
   }
 
-  // Find highest EPSS score among all CVE aliases
   let epssMax: number | null = null;
   for (const cve of cveIds) {
     const entry = epssScores.get(cve);
@@ -220,12 +215,11 @@ export function computeExploitScore(
     return { score: 0, inKev: false, epssMax: null };
   }
 
-  // Graduated EPSS scoring
   let score = 0;
-  if (epssMax >= 0.5) score = 20;       // top ~2% — actively exploited
-  else if (epssMax >= 0.1) score = 15;   // top ~10% — high likelihood
-  else if (epssMax >= 0.01) score = 8;   // top ~30% — moderate likelihood
-  else score = 2;                         // low likelihood but data exists
+  if (epssMax >= 0.5) score = 20;
+  else if (epssMax >= 0.1) score = 15;
+  else if (epssMax >= 0.01) score = 8;
+  else score = 2;
 
   return { score, inKev: false, epssMax };
 }

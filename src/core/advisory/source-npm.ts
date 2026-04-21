@@ -248,7 +248,7 @@ async function fetchOneBulk(
       signal: AbortSignal.timeout(30_000),
     };
     if (dispatcher) init.dispatcher = dispatcher;
-    response = await fetch(NPM_BULK_URL, init);
+    response = await fetch(url, init);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`npm bulk request failed: ${msg}`);

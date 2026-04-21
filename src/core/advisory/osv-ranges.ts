@@ -56,8 +56,12 @@ export function extractFixVersion(events: OsvEvent[]): string | null {
 export function affectedToSemverRange(affected: OsvAffected): string {
   const allRanges: string[] = [];
 
+  if (!Array.isArray(affected.ranges)) return '';
+
   for (const range of affected.ranges) {
+    if (!range || typeof range !== 'object') continue;
     if (range.type === 'GIT') continue; // skip git ranges
+    if (!Array.isArray(range.events)) continue;
     const converted = eventsToSemverRange(range.events);
     if (converted) {
       allRanges.push(converted);

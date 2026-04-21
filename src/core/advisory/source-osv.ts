@@ -21,8 +21,7 @@ import * as logger from '../../utils/logger.js';
 const OSV_BATCH_URL = 'https://api.osv.dev/v1/querybatch';
 const OSV_VULN_URL = 'https://api.osv.dev/v1/vulns';
 const MAX_BATCH_SIZE = 1000;
-const MAX_CONCURRENT_FETCHES = 10; // applies to individual vuln-detail GETs
-const MAX_CONCURRENT_BATCHES = 5; // applies to POST /querybatch — heavier server-side, keep lower
+const MAX_CONCURRENT_FETCHES = 10;
 const MAX_RESPONSE_SIZE = 50 * 1024 * 1024; // 50MB
 const MAX_INDIVIDUAL_SIZE = 1 * 1024 * 1024; // 1MB
 
@@ -55,49 +54,40 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
   }
 
   // Execute batch queries with bounded parallelism.
-  // Sequential awaits here previously made 50k-package scans 50 serial round trips.
-  // Failures are isolated per-batch via Promise.allSettled — one bad batch does not abort the rest.
+  const MAX_CONCURRENT_BATCHES = 5;
   const allVulnIds = new Set<string>();
-
-  const runBatch = async (batch: typeof packages): Promise<OsvBatchResponse> => {
+  const runBatch = async (batch: typeof packages): Promise<void> => {
     const query: OsvBatchQuery = {
       queries: batch.map((pkg) => ({
         version: pkg.version,
-        package: {
-          name: pkg.name,
-          ecosystem: 'npm',
-        },
+        package: { name: pkg.name, ecosystem: 'npm' },
       })),
     };
-    const response = await fetchWithValidation(OSV_BATCH_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(query),
-    }, MAX_RESPONSE_SIZE);
-    return response as OsvBatchResponse;
+    const batchResponse = await fetchJsonWithValidation<OsvBatchResponse>(
+      OSV_BATCH_URL,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(query),
+      },
+      { maxSize: MAX_RESPONSE_SIZE, pool: true },
+    );
+    if (batchResponse.results) {
+      for (const r of batchResponse.results) {
+        if (r.vulns) {
+          for (const v of r.vulns) allVulnIds.add(v.id);
+        }
+      }
+    }
   };
 
-    try {
-      const batchResponse = await fetchJsonWithValidation<OsvBatchResponse>(
-        OSV_BATCH_URL,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(query),
-        },
-        { maxSize: MAX_RESPONSE_SIZE, pool: true },
-      );
-
-      if (batchResponse.results) {
-        for (const result of batchResponse.results) {
-          if (result.vulns) {
-            for (const vuln of result.vulns) {
-              allVulnIds.add(vuln.id);
-            }
-          }
-        }
-      } else {
-        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
+    const chunk = batches.slice(i, i + MAX_CONCURRENT_BATCHES);
+    const results = await Promise.allSettled(chunk.map((b) => runBatch(b)));
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        const reason = r.reason;
+        const msg = reason instanceof Error ? reason.message : String(reason);
         errors.push(`OSV batch query failed: ${msg}`);
         logger.warn(`OSV batch query failed: ${msg}`);
       }
@@ -129,20 +119,21 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
     }
   }
 
-  // Convert to Advisory map keyed by package name.
-  // Each advisory is parsed in a try/catch so a single malformed `affected` entry
-  // does not drop the other advisories in the response.
+  // Convert to Advisory map keyed by package name
   const advisories = new Map<string, Advisory[]>();
 
   for (const vuln of fullVulns) {
-    if (!vuln || !Array.isArray(vuln.affected)) continue;
+    if (!Array.isArray(vuln.affected)) continue;
     for (const affected of vuln.affected) {
       try {
-        if (!affected?.package?.ecosystem || !affected.package.name) continue;
+        if (!affected || typeof affected !== 'object') continue;
+        if (!affected.package || typeof affected.package !== 'object') continue;
+        if (typeof affected.package.ecosystem !== 'string') continue;
         if (affected.package.ecosystem.toLowerCase() !== 'npm') continue;
-        if (!Array.isArray(affected.ranges)) continue;
 
         const pkgName = affected.package.name;
+        if (typeof pkgName !== 'string' || !pkgName) continue;
+
         const advisory: Advisory = {
           id: vuln.id,
           aliases: vuln.aliases ?? [],
@@ -161,8 +152,7 @@ export async function fetchOsvAdvisories(graph: DependencyGraph): Promise<OsvFet
         existing.push(advisory);
         advisories.set(pkgName, existing);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(`Skipping malformed OSV affected entry in ${vuln.id}: ${msg}`);
+        logger.debug(`OSV affected entry skipped: ${err instanceof Error ? err.message : err}`);
       }
     }
   }

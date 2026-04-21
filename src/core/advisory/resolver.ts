@@ -158,6 +158,7 @@ export async function resolveAdvisories(
 
       const result: ResolverResult = {
         advisories: osvResult.advisories,
+        sourceId: 'osv',
         source: 'OSV.dev API (real-time)',
         confidence: 'HIGH',
         errors: [],
@@ -173,6 +174,7 @@ export async function resolveAdvisories(
 
       const result: ResolverResult = {
         advisories: osvResult.advisories,
+        sourceId: 'osv-partial',
         source: 'OSV.dev API (partial)',
         confidence: 'MEDIUM',
         errors,
@@ -195,6 +197,7 @@ export async function resolveAdvisories(
     logger.info(`Using ${cachedAdvisories.size} cached advisory entries`);
     const result: ResolverResult = {
       advisories: cachedAdvisories,
+      sourceId: 'cache',
       source: 'Local cache',
       confidence: 'MEDIUM',
       errors,
@@ -210,6 +213,7 @@ export async function resolveAdvisories(
     logger.info(`Using ${offlineAdvisories.size} entries from offline index`);
     const result: ResolverResult = {
       advisories: offlineAdvisories,
+      sourceId: 'offline',
       source: 'Bundled offline index',
       confidence: 'LOW',
       errors,
@@ -230,6 +234,7 @@ export async function resolveAdvisories(
       errors.push(...npmResult.errors);
       const result: ResolverResult = {
         advisories: npmResult.advisories,
+        sourceId: 'npm-bulk',
         source: 'npm bulk advisory endpoint',
         confidence: npmResult.errors.length > 0 ? 'LOW' : 'MEDIUM',
         errors,
