@@ -47,7 +47,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@cyclonedx/cyclonedx-npm": "^2.0.0",
+    "@cyclonedx/cyclonedx-npm": "^6.0.1",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.17.0",
     "@types/semver": "^7.5.8",
