@@ -67,7 +67,7 @@ jobs:
       # artifact tab without re-running.
       - name: Upload scan stderr on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: auditfix-stderr
           path: |
