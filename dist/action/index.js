@@ -33348,7 +33348,7 @@ import { readFileSync as readFileSync6 } from "fs";
 var COMMENT_MARKER = "<!-- auditfix-scan -->";
 var API_BASE = "https://api.github.com";
 var TIMEOUT_MS = 15e3;
-var VERSION = "2.0.0";
+var VERSION = "2.1.0";
 function getPrNumber() {
   const ref = process.env.GITHUB_REF ?? "";
   const refMatch = /^refs\/pull\/(\d+)\/merge$/.exec(ref);
@@ -34554,7 +34554,7 @@ async function run() {
     setOutput("fixable-count", vulns.filter((v) => v.risk.factors.fixAvailable).length);
     setOutput("exit-code", failOn === "none" ? 0 : getExitCodeForStrategy(report, failOn));
     if (generateSarif) {
-      const sarifContent = renderSarifReport(report, "2.0.0");
+      const sarifContent = renderSarifReport(report, "2.1.0");
       writeFileSync3("auditfix-results.sarif", sarifContent);
       setOutput("sarif-file", "auditfix-results.sarif");
       await uploadSarif(sarifContent, sarifCategory);

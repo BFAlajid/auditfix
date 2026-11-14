@@ -46,7 +46,7 @@ import { readProjectName } from '../utils/package-name.js';
 import { createCoalescingRunner } from '../utils/coalesce-runner.js';
 import chalk from 'chalk';
 
-const VERSION = process.env.AUDITFIX_VERSION ?? '2.0.0';
+const VERSION = process.env.AUDITFIX_VERSION ?? '2.1.0';
 
 const SEVERITY_CHOICES = ['critical', 'high', 'medium', 'low', 'info'];
 

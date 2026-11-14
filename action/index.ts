@@ -172,7 +172,7 @@ async function run(): Promise<void> {
 
     // Generate and upload SARIF
     if (generateSarif) {
-      const sarifContent = renderSarifReport(report, '2.0.0');
+      const sarifContent = renderSarifReport(report, process.env.AUDITFIX_VERSION ?? '2.1.0');
       writeFileSync('auditfix-results.sarif', sarifContent);
       setOutput('sarif-file', 'auditfix-results.sarif');
       await uploadSarif(sarifContent, sarifCategory);

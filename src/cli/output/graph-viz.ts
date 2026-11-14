@@ -423,7 +423,7 @@ function escapeDotLabel(s: string): string {
 /* ------------------------------------------------------------------ */
 
 const HTML_MAX_NODES = 2000;
-const VERSION = '2.0.0';
+const VERSION = process.env.AUDITFIX_VERSION ?? '2.1.0';
 
 export function renderHTML(report: AuditReport, projectName: string): string {
   const graph = getGraph(report);

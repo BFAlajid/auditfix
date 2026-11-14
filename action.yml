@@ -38,25 +38,9 @@ inputs:
   json-output:
     description: 'Write JSON report to this file path'
     required: false
-  check-typosquats:
-    description: 'Detect typosquatting packages'
-    required: false
-    default: 'false'
-  check-provenance:
-    description: 'Verify npm provenance attestations'
-    required: false
-    default: 'false'
-  scan-behavior:
-    description: 'Scan for suspicious behavior patterns'
-    required: false
-    default: 'false'
   webhook-url:
     description: 'Webhook URL for notifications (Slack/Teams/Discord/generic). Pass as a secret, never inline: webhook-url: ${{ secrets.TEAMS_WEBHOOK_URL }}'
     required: false
-  version:
-    description: 'auditfix version (default: latest)'
-    required: false
-    default: 'latest'
 
 outputs:
   vulnerability-count:

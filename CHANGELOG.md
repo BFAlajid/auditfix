@@ -5,7 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] - 2025-05-15
+## [2.1.0] - UNRELEASED
+
+First npm release since 1.2.0. Versions 1.3.0 through 2.0.0 were never published to npm, so everything listed under those versions below is also new for anyone upgrading from 1.2.0.
+
+### Added
+
+- **SBOM and VEX output**: SPDX 2.3 SBOM, CycloneDX 1.5 SBOM with embedded VEX, and CSAF 2.0 VEX (`--sbom`, `--vex`).
+- **Dependency graph visualization** in Mermaid, DOT and standalone HTML/SVG (`--graph-out <path>`).
+- **Lockfile support** for `bun.lock` and `deno.lock`.
+- **GHSA GraphQL enrichment** (`--ghsa-token`, falls back to `GITHUB_TOKEN`/`GH_TOKEN`) and `.npmrc` auth for private npm registries.
+- **Config validation** migrated to zod schemas.
+- **Policy flags** `--policy <path>` and `--no-policy`, and `--no-cache` to bypass the advisory cache.
+- Release tooling: CI matrix, CodeQL, OpenSSF Scorecard, Dependabot, Biome, and an npm release workflow with provenance.
+
+### Changed
+
+- OSV, npm and EPSS requests use a pooled HTTP agent (undici) with bounded parallelism.
+- The GitHub Action ships as a committed bundle (`dist/action/index.js`).
+- Action version strings (SARIF driver, PR comment, graph output) now follow the package version.
+
+### Fixed
+
+- Webhook SSRF guard with DNS resolution checks, and markdown escaping in PR comments.
+- Remote advisory fetches (EPSS, KEV, offline index) enforce size caps and retries; poisoned or oversized responses are rejected.
+- YAML policy loading hardened against prototype pollution, path traversal and log leakage.
+- Fixer: plans are deduplicated by package and fix version, overrides persist on success and roll back on install failure, yarn strategy added.
+- Lockfile parsers (npm, pnpm, yarn classic, yarn berry): no match returns `null` instead of a wrong version, optional deps are no longer treated as production, key lengths are capped.
+- Advisory matching, scoring tiebreaks, cache batch isolation and source id handling.
+- Build: offline advisory index is resolved dynamically so a clean checkout builds.
+
+### Removed
+
+- Unused GitHub Action inputs `check-typosquats`, `check-provenance`, `scan-behavior` and `version`. They were declared but never read; the action bundles its own scanner. Use the CLI flags of the same names for those checks.
+
+## [2.0.0] - 2026-03-07
 
 ### Added
 

@@ -10,7 +10,7 @@ Smarter npm dependency security CLI. Replaces `npm audit` with production reacha
 ## Example Output
 
 ```
-auditfix v2.0.0 — scanned 847 packages
+auditfix v2.1.0 — scanned 847 packages
 
 CRITICAL (1)
   lodash@4.17.20 — Prototype Pollution in lodash

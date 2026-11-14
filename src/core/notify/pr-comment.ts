@@ -9,7 +9,7 @@ import * as logger from '../../utils/logger.js';
 const COMMENT_MARKER = '<!-- auditfix-scan -->';
 const API_BASE = 'https://api.github.com';
 const TIMEOUT_MS = 15_000;
-const VERSION = '2.0.0';
+const VERSION = process.env.AUDITFIX_VERSION ?? '2.1.0';
 
 // ── Exported types ──────────────────────────────────────────────────────────
 
