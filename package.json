@@ -46,7 +46,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
+    "@biomejs/biome": "^2.5.14",
     "@cyclonedx/cyclonedx-npm": "^2.0.0",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.17.0",
