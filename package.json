@@ -59,6 +59,7 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.map",
     "action.yml",
     "README.md",
     "LICENSE"
